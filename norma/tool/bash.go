@@ -28,15 +28,20 @@ var catastrophicBash = []*regexp.Regexp{
 // the background on timeout.
 var disallowedAutoBackground = []string{"sleep"}
 
+const (
+	defaultBashTimeout = 300 * time.Second
+	maxBashTimeout     = 600 * time.Second
+)
+
 // NewBash builds the Bash tool: run a shell command with a timeout, optionally in
 // the background.
 func NewBash() CoreTool {
 	props := map[string]any{
 		"command":    map[string]any{"type": "string", "description": "The shell command to execute."},
-		"timeout_ms": map[string]any{"type": "integer", "description": "Timeout in ms (default 120000, max 600000)."},
+		"timeout_ms": map[string]any{"type": "integer", "description": "Timeout in ms (default 300000, max 600000)."},
 	}
 	desc := "Executes a shell command in the working directory and returns combined stdout and stderr. Use for running tests, builds, package managers, and git. Prefer the dedicated file tools for file work."
-	prompt := "The command runs through the shell, so you are not limited to one command: chain steps with && or ;, use pipes, and pass multi-line scripts or heredocs. For anything beyond a simple one-liner — loops, parsing, string/JSON handling, HTTP logic, computation — prefer writing a short script (Python, Node, shell, etc.) and executing it (e.g. via a heredoc or by writing a file then running it) rather than forcing everything into a single command. A timeout (default 120s, max 600s) applies. Avoid commands needing interactive input."
+	prompt := "The command runs through the shell, so you are not limited to one command: chain steps with && or ;, use pipes, and pass multi-line scripts or heredocs. For anything beyond a simple one-liner — loops, parsing, string/JSON handling, HTTP logic, computation — prefer writing a short script (Python, Node, shell, etc.) and executing it (e.g. via a heredoc or by writing a file then running it) rather than forcing everything into a single command. A timeout (default 300s, max 600s) applies. For work expected to exceed the timeout, set run_in_background=true and use TaskOutput with block=true instead of sleep-and-poll loops. Avoid commands needing interactive input."
 	if !BackgroundTasksDisabled() {
 		props["run_in_background"] = map[string]any{
 			"type":        "boolean",
@@ -83,11 +88,11 @@ func runBash(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 	if strings.TrimSpace(in.Command) == "" {
 		return Errorf("Error: command is required"), nil
 	}
-	timeout := 120 * time.Second
+	timeout := defaultBashTimeout
 	if in.TimeoutMS > 0 {
 		timeout = time.Duration(in.TimeoutMS) * time.Millisecond
-		if timeout > 600*time.Second {
-			timeout = 600 * time.Second
+		if timeout > maxBashTimeout {
+			timeout = maxBashTimeout
 		}
 	}
 

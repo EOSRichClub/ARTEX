@@ -35,9 +35,12 @@ RUN CGO_ENABLED=0 GOARCH="${TARGETARCH}" go build -tags embedui -trimpath -o /ou
 ########## 阶段 3：运行镜像（同原版：工具 + Playwright 预装）##########
 FROM python:3.12-slim-bookworm
 ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG PLAYWRIGHT_MCP_VERSION=0.0.83
+ARG PLAYWRIGHT_CLI_VERSION=0.1.22
 # 运行层的全局 npm 装包与 chromium 下载同样走国内源（对全球网络同样可达）
 ENV npm_config_registry=$NPM_REGISTRY \
-    PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+    PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -46,14 +49,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
-# 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
-# @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
-# @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
-# 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
-# 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+# Playwright MCP 与 CLI 必须使用同一套精确依赖。不能混装 playwright@latest：
+# 它可能下载另一个 Chromium revision，造成 MCP 启动时提示 executable 不存在。
+RUN npm install -g \
+      "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
+      "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}" \
     && playwright-cli --help \
-    && playwright install --with-deps chromium \
+    && /usr/local/lib/node_modules/@playwright/mcp/node_modules/.bin/playwright install --with-deps chromium \
+    && playwright-mcp --help \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # 构建阶段产出的单二进制（内嵌前端）

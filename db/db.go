@@ -259,10 +259,23 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 	// visibility) on restart.
 	if _, err := d.Exec(`
 INSERT INTO mcp_servers(name, transport, command, args, env, enabled)
-VALUES ('browser', 'stdio', 'npx', $1, '{}', false)
+VALUES ('browser', 'stdio', 'playwright-mcp', $1, '{}', false)
 ON CONFLICT (name) DO NOTHING`,
-		`["@playwright/mcp","--headless"]`); err != nil {
+		`["--headless","--browser","chromium"]`); err != nil {
 		return fmt.Errorf("seed browser mcp: %w", err)
+	}
+	// Upgrade only the untouched legacy built-in row. The exact command/args
+	// guard preserves every user-customised browser MCP configuration.
+	if _, err := d.Exec(`
+UPDATE mcp_servers
+SET command='playwright-mcp', args=$1, updated_at=now()
+WHERE name='browser'
+  AND transport='stdio'
+  AND command='npx'
+  AND args=$2::jsonb`,
+		`["--headless","--browser","chromium"]`,
+		`["@playwright/mcp","--headless"]`); err != nil {
+		return fmt.Errorf("upgrade browser mcp: %w", err)
 	}
 	// NOTE: the placeholder ScopeSentry data-source MCP (empty URL + empty X-API-Key,
 	// disabled) is seeded directly in schema.sql §F so a raw `psql < schema.sql` init

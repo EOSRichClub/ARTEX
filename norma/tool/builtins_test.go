@@ -182,6 +182,30 @@ func TestWebFetch(t *testing.T) {
 	}
 }
 
+func TestWebFetchRetriesTransientStatus(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits < 3 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte(`<h1>Recovered</h1>`))
+	}))
+	defer srv.Close()
+
+	raw, _ := json.Marshal(map[string]any{"url": srv.URL})
+	res, err := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+	if err != nil {
+		t.Fatalf("webfetch: %v", err)
+	}
+	if hits != 3 || !strings.Contains(res.Flatten(), "Recovered") {
+		t.Fatalf("hits=%d output=%q", hits, res.Flatten())
+	}
+}
+
 func TestWebFetchRejectsStaticAssets(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -240,6 +264,28 @@ func TestProxyLikelyErr(t *testing.T) {
 	}
 	if proxyLikelyErr(nil) {
 		t.Error("nil error must be false")
+	}
+}
+
+func TestTransientFetchErr(t *testing.T) {
+	for _, s := range []string{
+		"context deadline exceeded",
+		"i/o timeout",
+		"read tcp: connection reset by peer",
+		"proxyconnect tcp: connection refused",
+	} {
+		if !transientFetchErr(errors.New(s)) {
+			t.Errorf("want transient for %q", s)
+		}
+	}
+	for _, s := range []string{
+		"dial tcp: lookup nope.invalid: no such host",
+		"context canceled",
+		"unsupported protocol scheme",
+	} {
+		if transientFetchErr(errors.New(s)) {
+			t.Errorf("want permanent for %q", s)
+		}
 	}
 }
 

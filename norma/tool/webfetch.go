@@ -5,12 +5,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +70,13 @@ func NewWebFetch(cfg WebFetchConfig) CoreTool {
 }
 
 const maxFetchBytes = 2 << 20 // 2 MiB
+
+const (
+	webFetchTotalTimeout = 90 * time.Second
+	webFetchTryTimeout   = 28 * time.Second
+	webFetchMaxRetries   = 2
+	webFetchMaxRetryWait = 15 * time.Second
+)
 
 // newFetchClient returns an HTTP client honoring the proxy / TLS config.
 func newFetchClient(cfg WebFetchConfig) *http.Client {
@@ -124,6 +135,89 @@ func proxyLikelyErr(err error) bool {
 	return false
 }
 
+// transientFetchErr reports whether repeating the same request may succeed.
+// Per-attempt deadlines are retryable; cancellation of the outer request is
+// handled separately by the caller and is never retried.
+func transientFetchErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "no such host") || strings.Contains(s, "context canceled") {
+		return false
+	}
+	for _, p := range []string{
+		"context deadline exceeded", "timeout", "eof", "connection reset",
+		"connection refused", "proxyconnect", "broken pipe", "temporarily unavailable",
+		"tls handshake timeout", "http2", "http/2", "protocol error",
+	} {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func retryableFetchStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func fetchRetryDelay(attempt int, retryAfter string) time.Duration {
+	if retryAfter != "" {
+		if seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && seconds >= 0 {
+			d := time.Duration(seconds) * time.Second
+			if d > webFetchMaxRetryWait {
+				return webFetchMaxRetryWait
+			}
+			return d
+		}
+		if at, err := http.ParseTime(retryAfter); err == nil {
+			d := time.Until(at)
+			if d < 0 {
+				return 0
+			}
+			if d > webFetchMaxRetryWait {
+				return webFetchMaxRetryWait
+			}
+			return d
+		}
+	}
+	// 500ms, 1s, ... plus a small jitter to avoid synchronized retries.
+	return (500*time.Millisecond)<<attempt + time.Duration(rand.IntN(250))*time.Millisecond
+}
+
+func waitFetchRetry(ctx context.Context, delay time.Duration) bool {
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func doFetchAttempt(ctx context.Context, client *http.Client, rawURL string) (*http.Response, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, webFetchTryTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("user-agent", "norma/0.4")
+	return client.Do(req)
+}
+
 // staticAssetExts are file extensions WebFetch refuses: linked resources (scripts,
 // styles, source maps, images, fonts, media, wasm) that are not page content.
 var staticAssetExts = map[string]bool{
@@ -179,29 +273,48 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		if ext := staticAssetExt(in.URL); ext != "" {
 			return Errorf("Error: WebFetch does not fetch static assets (" + ext + " file). It reads HTML pages, documentation, and API responses — not linked resources like scripts, styles, images, or fonts. Fetch the page that references this asset instead."), nil
 		}
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		cctx, cancel := context.WithTimeout(ctx, webFetchTotalTimeout)
 		defer cancel()
-		req, err := http.NewRequestWithContext(cctx, http.MethodGet, in.URL, nil)
-		if err != nil {
-			return Errorf("Error: " + err.Error()), nil
+		var resp *http.Response
+		var err error
+		attempts := 0
+		for attempt := 0; attempt <= webFetchMaxRetries; attempt++ {
+			attempts = attempt + 1
+			resp, err = doFetchAttempt(cctx, client, in.URL)
+			if err != nil {
+				if cctx.Err() != nil || !transientFetchErr(err) || attempt == webFetchMaxRetries {
+					break
+				}
+				if !waitFetchRetry(cctx, fetchRetryDelay(attempt, "")) {
+					break
+				}
+				continue
+			}
+			if !retryableFetchStatus(resp.StatusCode) || attempt == webFetchMaxRetries {
+				break
+			}
+			retryAfter := resp.Header.Get("Retry-After")
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+			_ = resp.Body.Close()
+			resp = nil
+			if !waitFetchRetry(cctx, fetchRetryDelay(attempt, retryAfter)) {
+				err = cctx.Err()
+				break
+			}
 		}
-		req.Header.Set("user-agent", "norma/0.4")
-		resp, err := client.Do(req)
 		// One direct retry when the proxied attempt failed for a proxy-caused reason.
 		// A non-proxy error (bad host, caller timeout/cancel) is returned as-is — a
 		// direct retry wouldn't fix it. The direct response is NOT captured by the proxy.
 		if err != nil && direct != nil && proxyLikelyErr(err) {
-			if r2, e2 := http.NewRequestWithContext(cctx, http.MethodGet, in.URL, nil); e2 == nil {
-				r2.Header.Set("user-agent", "norma/0.4")
-				if resp2, err2 := direct.Do(r2); err2 == nil {
-					resp, err = resp2, nil
-				} else {
-					err = err2 // surface the direct failure (more representative of the target)
-				}
+			attempts++
+			if resp2, err2 := doFetchAttempt(cctx, direct, in.URL); err2 == nil {
+				resp, err = resp2, nil
+			} else {
+				err = err2 // surface the direct failure (more representative of the target)
 			}
 		}
 		if err != nil {
-			return Errorf("Error fetching URL: " + err.Error()), nil
+			return Errorf(fmt.Sprintf("Error fetching URL after %d attempt(s): %v", attempts, err)), nil
 		}
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
