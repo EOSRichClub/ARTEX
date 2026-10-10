@@ -200,6 +200,8 @@ func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 // GIT_SSL_CAINFO→git, NODE_EXTRA_CA_CERTS→node; NODE_USE_ENV_PROXY makes Node 24+
 // honor the proxy vars. ALL_PROXY is set too so a socks5 egress proxy (which curl
 // only reads from ALL_PROXY, not HTTP(S)_PROXY) works in the capture-off path.
+// Loopback and the local proxy gateway must bypass the proxy so health checks and
+// local MCP/container calls cannot be reflected back through the external exit.
 // Empty proxyAddr → nil (direct, unchanged env).
 func proxyEnv(proxyAddr, caCert string) []string {
 	if proxyAddr == "" {
@@ -209,6 +211,8 @@ func proxyEnv(proxyAddr, caCert string) []string {
 		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
 		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
 		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
+		"NO_PROXY=127.0.0.1,localhost,172.30.0.1,::1",
+		"no_proxy=127.0.0.1,localhost,172.30.0.1,::1",
 		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
 	}
 	if caCert != "" {

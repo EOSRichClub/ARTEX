@@ -261,7 +261,7 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 INSERT INTO mcp_servers(name, transport, command, args, env, enabled)
 VALUES ('browser', 'stdio', 'playwright-mcp', $1, '{}', false)
 ON CONFLICT (name) DO NOTHING`,
-		`["--headless","--browser","chromium"]`); err != nil {
+		`["--headless","--browser","chromium","--isolated"]`); err != nil {
 		return fmt.Errorf("seed browser mcp: %w", err)
 	}
 	// Upgrade only the untouched legacy built-in row. The exact command/args
@@ -273,9 +273,23 @@ WHERE name='browser'
   AND transport='stdio'
   AND command='npx'
   AND args=$2::jsonb`,
-		`["--headless","--browser","chromium"]`,
+		`["--headless","--browser","chromium","--isolated"]`,
 		`["@playwright/mcp","--headless"]`); err != nil {
 		return fmt.Errorf("upgrade browser mcp: %w", err)
+	}
+	// Every ARTEX task owns an independent MCP stdio process. Without --isolated,
+	// Playwright MCP makes those processes contend for one persistent Chrome
+	// profile and all but the first fail with "Browser is already in use".
+	// Append the flag idempotently to existing built-in rows while preserving
+	// operator-supplied executable, proxy and other arguments.
+	if _, err := d.Exec(`
+UPDATE mcp_servers
+SET args=COALESCE(args, '[]'::jsonb) || '["--isolated"]'::jsonb, updated_at=now()
+WHERE name='browser'
+  AND transport='stdio'
+  AND command='playwright-mcp'
+  AND NOT (COALESCE(args, '[]'::jsonb) ? '--isolated')`); err != nil {
+		return fmt.Errorf("enable isolated browser mcp sessions: %w", err)
 	}
 	// NOTE: the placeholder ScopeSentry data-source MCP (empty URL + empty X-API-Key,
 	// disabled) is seeded directly in schema.sql §F so a raw `psql < schema.sql` init
