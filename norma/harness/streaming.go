@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"sync"
 
 	"github.com/Autumn-27/norma/llm"
@@ -15,6 +16,7 @@ import (
 // arrival order; progress is yielded as soon as it arrives.
 type streamExec struct {
 	l      *loop
+	ctx    context.Context // snapshot: a later settlement must not revive this turn
 	mu     sync.Mutex
 	tools  []*tracked
 	notify chan struct{} // pinged when a tool completes or emits progress
@@ -30,16 +32,17 @@ const (
 )
 
 type tracked struct {
-	block  llm.ContentBlock
-	safe   bool
-	status toolStatus
-	result llm.ContentBlock
-	extra  []llm.Message // messages the tool injects after its result (Result.Extra)
-	prog   []string
+	block   llm.ContentBlock
+	safe    bool
+	status  toolStatus
+	result  llm.ContentBlock
+	extra   []llm.Message // messages the tool injects after its result (Result.Extra)
+	prog    []string
+	release func() // actual goroutine completion, distinct from a synthetic result
 }
 
 func newStreamExec(l *loop) *streamExec {
-	return &streamExec{l: l, notify: make(chan struct{}, 1)}
+	return &streamExec{l: l, ctx: l.toolCtx, notify: make(chan struct{}, 1)}
 }
 
 func (e *streamExec) ping() {
@@ -82,6 +85,7 @@ func (e *streamExec) processQueue() {
 		}
 		if e.canStartLocked(t.safe) {
 			t.status = stExecuting
+			t.release = e.l.settlementControl.trackTool()
 			start = append(start, t)
 		} else if !t.safe {
 			break
@@ -94,18 +98,25 @@ func (e *streamExec) processQueue() {
 }
 
 func (e *streamExec) run(t *tracked) {
-	e.l.sem <- struct{}{} // bound concurrent tool execution
+	defer t.release()
+	select {
+	case e.l.sem <- struct{}{}: // bound concurrent tool execution
+	case <-e.ctx.Done():
+		return
+	}
 	defer func() { <-e.l.sem }()
-	res, extra := e.l.execOne(t.block, func(p tool.ProgressInfo) {
+	res, extra := e.l.execOneContext(e.ctx, t.block, func(p tool.ProgressInfo) {
 		e.mu.Lock()
 		t.prog = append(t.prog, p.Message)
 		e.mu.Unlock()
 		e.ping()
 	})
 	e.mu.Lock()
-	t.result = res
-	t.extra = extra
-	t.status = stCompleted
+	if t.status != stYielded {
+		t.result = res
+		t.extra = extra
+		t.status = stCompleted
+	}
 	e.mu.Unlock()
 	e.ping()
 	e.processQueue() // a slot freed
@@ -167,7 +178,7 @@ func (e *streamExec) finish() (consumerStopped, aborted bool) {
 		// run's own MaxDuration deadline firing on an in-flight tool. Either way we
 		// synthesize interrupted results and report aborted; the turn loop then decides
 		// (parent-cancel → abort, budget-only → wrap-up) via ctx vs toolCtx.
-		if e.l.toolCtx.Err() != nil {
+		if e.ctx.Err() != nil {
 			return !e.drainSynthetic("tool execution interrupted"), true
 		}
 		if !e.pending() {
@@ -178,7 +189,7 @@ func (e *streamExec) finish() (consumerStopped, aborted bool) {
 		}
 		select {
 		case <-e.notify:
-		case <-e.l.toolCtx.Done():
+		case <-e.ctx.Done():
 		}
 	}
 }

@@ -1471,3 +1471,87 @@ CREATE TABLE IF NOT EXISTS finding_case_review_runs (
 );
 
 ALTER TABLE finding_case_review_runs ADD COLUMN IF NOT EXISTS finding_ids JSONB NOT NULL DEFAULT '[]';
+
+-- ScopeSentry sync history is global provenance, not an ARTEX task-owned graph.
+-- Removing an MCP or asset keeps the request and raw observation auditable.
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id BIGSERIAL PRIMARY KEY,
+    source_mcp_id BIGINT REFERENCES mcp_servers(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running','success','partial','failed','interrupted')),
+    request JSONB NOT NULL,
+    result JSONB NOT NULL DEFAULT '{}',
+    fetched INTEGER NOT NULL DEFAULT 0,
+    written INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    derived_ip_written INTEGER NOT NULL DEFAULT 0,
+    derived_ip_failed INTEGER NOT NULL DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS sync_observations (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    target TEXT NOT NULL,
+    source_target_id TEXT NOT NULL DEFAULT '',
+    asset_type TEXT NOT NULL,
+    item_index INTEGER NOT NULL,
+    source_asset_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('written','skipped','failed')),
+    reason TEXT NOT NULL DEFAULT '',
+    asset_id BIGINT REFERENCES assets(id) ON DELETE SET NULL,
+    derived_ip_written INTEGER NOT NULL DEFAULT 0,
+    derived_ip_failed INTEGER NOT NULL DEFAULT 0,
+    raw JSONB,
+    raw_omitted BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (run_id,target,asset_type,item_index)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_observations_run ON sync_observations(run_id,id);
+CREATE INDEX IF NOT EXISTS idx_sync_observations_asset ON sync_observations(asset_id) WHERE asset_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sync_runs_source ON sync_runs(source_mcp_id) WHERE source_mcp_id IS NOT NULL;
+
+-- Persist the source page before applying any row, so a restart replays the
+-- exact downloaded page instead of a shifted source page number.
+CREATE TABLE IF NOT EXISTS sync_pages (
+    run_id BIGINT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    target TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    page INTEGER NOT NULL,
+    items JSONB NOT NULL,
+    item_count INTEGER NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT false,
+    last_page BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (run_id,target,asset_type,page)
+);
+
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS created INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS updated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS unchanged INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_observations ADD COLUMN IF NOT EXISTS outcome TEXT NOT NULL DEFAULT '';
+ALTER TABLE sync_observations ADD COLUMN IF NOT EXISTS asset_changes JSONB NOT NULL DEFAULT '[]';
+CREATE TABLE IF NOT EXISTS sync_asset_changes (
+    run_id BIGINT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    original_asset_id BIGINT NOT NULL,
+    asset_id BIGINT REFERENCES assets(id) ON DELETE SET NULL,
+    asset_type TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('created','updated','unchanged')),
+    direct BOOLEAN NOT NULL,
+    PRIMARY KEY (run_id,original_asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_asset_changes_asset ON sync_asset_changes(asset_id) WHERE asset_id IS NOT NULL;
+
+-- A completion attempt is separate from task lifecycle and goal evidence.
+-- The row is also the persistent admission barrier while workers settle.
+CREATE TABLE IF NOT EXISTS task_completions (
+    task_id BIGINT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id BIGINT NOT NULL DEFAULT 1,
+    phase TEXT NOT NULL CHECK (phase IN ('draining','reviewing','completed','interrupted')),
+    reason TEXT NOT NULL DEFAULT '',
+    snapshot JSONB NOT NULL DEFAULT '{}',
+    input_digest TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deadline_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

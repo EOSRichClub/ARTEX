@@ -118,9 +118,14 @@ type Engine struct {
 	// so pausing can CANCEL an in-flight run (not just skip the next one). Recreated
 	// on resume since cancelling is one-shot. Every cancellation carries a named
 	// cause so the activity trace can identify the initiating control path.
-	execMu     sync.Mutex
-	execCancel map[string]context.CancelCauseFunc
-	execCtx    map[string]context.Context
+	execMu           sync.Mutex
+	execCancel       map[string]context.CancelCauseFunc
+	execCtx          map[string]context.Context
+	execSettlement   map[string]*harness.SettlementController
+	execControllers  map[string][]*harness.SettlementController // includes cancelled epochs with callbacks still exiting
+	completionMu     sync.Mutex
+	completing       sync.Map // taskID -> *completionRun; also the execution admission gate
+	completionReplan sync.Map // taskID -> rejected review reason, delivered to the next ordinary Planner round
 
 	// Per-work control lets the planner kill a worker and lets the UI pause/cancel
 	// one intent without pausing the whole task. The done channel closes only after
@@ -176,7 +181,12 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 // Pause stops a task: marks it paused AND cancels any in-flight planner/worker run
 // for it (a long worker.Execute would otherwise keep going until it finishes).
 func (e *Engine) Pause(taskID string, cause error) {
+	e.completionMu.Lock()
 	e.paused.Store(taskID, true)
+	if value, ok := e.completing.Load(taskID); ok {
+		value.(*completionRun).cancel()
+	}
+	e.completionMu.Unlock()
 	e.cancelExec(taskID, cause)
 }
 
@@ -191,6 +201,11 @@ func (e *Engine) BeginDelete(taskID string) bool {
 		return false
 	}
 	e.paused.Store(taskID, true)
+	e.completionMu.Lock()
+	if value, ok := e.completing.Load(taskID); ok {
+		value.(*completionRun).cancel()
+	}
+	e.completionMu.Unlock()
 	e.deleteMu.Unlock()
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
 	return true
@@ -266,6 +281,8 @@ func (e *Engine) StopTask(taskID string) {
 	}
 	delete(e.execCancel, taskID)
 	delete(e.execCtx, taskID)
+	delete(e.execSettlement, taskID)
+	delete(e.execControllers, taskID)
 	e.execMu.Unlock()
 
 	e.runtimeMu.Lock()
@@ -285,6 +302,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
+	e.completionReplan.Delete(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
@@ -315,6 +333,9 @@ func (e *Engine) Resume(t *Task) {
 	if e.IsDeleting(t.ID) {
 		return
 	}
+	if e.completionStalled(t.ID) {
+		return
+	}
 	e.paused.Delete(t.ID)
 	t.Notify()
 }
@@ -334,9 +355,22 @@ func (e *Engine) execContextFor(parent context.Context, taskID string) context.C
 		return c
 	}
 	c, cancel := context.WithCancelCause(parent)
-	e.execCtx[taskID] = c
+	control := harness.NewSettlementController()
+	if e.isCompleting(taskID) {
+		control.Request()
+	}
+	if e.execSettlement == nil {
+		e.execSettlement = map[string]*harness.SettlementController{}
+	}
+	if e.execControllers == nil {
+		e.execControllers = map[string][]*harness.SettlementController{}
+	}
+	e.execControllers[taskID] = append(e.execControllers[taskID], control)
+	e.execSettlement[taskID] = control
+	wrapped := harness.WithSettlementController(c, control)
+	e.execCtx[taskID] = wrapped
 	e.execCancel[taskID] = cancel
-	return c
+	return wrapped
 }
 
 // IsPaused reports whether a task is user-paused.
@@ -835,29 +869,28 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		// 任务级超时收尾中:丢弃普通唤醒——worker 收尾写回、Resume 的 Notify 都不再
 		// 触发常规规划轮;终局那一轮由协调器(settleTask)直接驱动,不走这里。
-		if e.isSettling(t.ID) {
+		if e.isSettling(t.ID) || e.isCompleting(t.ID) {
 			return
 		}
-		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
-		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
-		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
-		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
-		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
-			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
-			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
-				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
-				// pause/delete/超时收尾的状态转换。
-				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
-					log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
-				} else if won {
-					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
-				}
+		// No active work is a completion candidate, not proof of success. The
+		// database checks every goal and every unfinished intent without a limit.
+		rejectedReview, needsReplan := e.completionReplan.Load(t.ID)
+		if active, err := t.Store.HasActiveIntent(); !needsReplan && err == nil && !active {
+			if err := e.requestCompletion(ctx, t, "所有工作已退出，申请终验", nil, false); err == nil {
+				t.drainTriggers()
+				return
 			}
-			return // goalless 分支永不进入 planner.Plan
-		}
-		if !e.beginTaskOperation(t.ID) {
+		} else if goals, err := t.Store.ListByKind(db.KindGoal, 1); !needsReplan && err == nil && len(goals) == 0 {
+			// A human may inject work without goals. Let that work execute before
+			// asking the planner to evaluate its persisted outcomes.
+			t.drainTriggers()
 			return
+		}
+		if !e.beginExecutionOperation(t.ID) {
+			return
+		}
+		if needsReplan {
+			e.completionReplan.CompareAndDelete(t.ID, rejectedReview)
 		}
 		defer e.decInflight(t.ID)
 		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
@@ -875,23 +908,22 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
+		if needsReplan {
+			triggers = append(triggers, agent.TriggerEvent{Kind: "completion_rejected", Detail: fmt.Sprint(rejectedReview)})
+		}
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		proposal := new(agent.CompletionProposal)
+		met, reason, err := planner.Plan(agent.WithCompletionProposal(ectx, proposal), taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
-		case met:
-			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
-			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
-			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
-				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
+		case met && ectx.Err() == nil:
+			if err := e.requestCompletion(ctx, t, reason, proposal.Decisions(), false); err != nil {
+				log.Printf("[completion] task %s 未满足收官条件: %v", t.ID, err)
+				e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: "目标已达成，但必要工作仍需完成或明确停止理由", Detail: err.Error()})
 			}
-			// 任务已判完成 → 立刻取消在跑的 worker：它们手头的意图跑出来也没意义了。
-			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
-			// 归为 stopped(而非 blocked)。
-			e.cancelExec(t.ID, agent.AbortGoalMet)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
@@ -948,8 +980,11 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
 		}
-		if !e.beginTaskOperation(t.ID) {
-			return
+		if !e.beginExecutionOperation(t.ID) {
+			if sleepCtx(ctx, 500*time.Millisecond) {
+				return
+			}
+			continue
 		}
 		claimed := e.runWorkerStep(ctx, t, name, worker)
 		e.decInflight(t.ID)
@@ -1030,7 +1065,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	maxRetries, retryBackoff := e.modelErrorRetryPolicy()
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
-		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID) && !e.isCompleting(t.ID); attempt++ {
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
 			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
 		if sleepCtx(workCtx, retryBackoff) {
@@ -1134,6 +1169,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
 	state := "done"
 	switch {
+	case reason == harness.ReasonSettlementRequested || e.isCompleting(t.ID):
+		state = "exhausted"
 	case err != nil:
 		state = "blocked"
 	case reason == harness.ReasonMaxTurns:
@@ -1169,7 +1206,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 // task pause/delete/shutdown still stops it). Returns an error if the run could not
 // be started; the intent is left untouched in that case.
 func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64, requestID, message, agentMessage string) error {
-	if !e.beginTaskOperation(t.ID) {
+	if !e.beginExecutionOperation(t.ID) {
 		return fmt.Errorf("task is being deleted")
 	}
 	release := true
@@ -1189,7 +1226,13 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	if node == nil || node.Kind != db.KindIntent {
 		return fmt.Errorf("intent not found")
 	}
+	e.completionMu.Lock()
+	if e.isCompleting(t.ID) || e.IsPaused(t.ID) || e.isSettling(t.ID) {
+		e.completionMu.Unlock()
+		return fmt.Errorf("task is paused or completing")
+	}
 	changed, err := t.Store.CompareAndSetIntentState(intentID, "paused", "running")
+	e.completionMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -1235,6 +1278,11 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
+	e.completionMu.Lock()
+	defer e.completionMu.Unlock()
+	if e.isCompleting(t.ID) || e.IsPaused(t.ID) || e.isSettling(t.ID) || e.IsDeleting(t.ID) {
+		return nil
+	}
 	fr, _ := t.Store.Frontier(20)
 	for _, in := range fr {
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {

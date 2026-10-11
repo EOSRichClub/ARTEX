@@ -178,6 +178,8 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 	b.WriteString("\n\n【本次触发本轮的实际变动（先看这里，再决定是否补方向）】：")
 	for _, ev := range evs {
 		switch ev.Kind {
+		case "completion_rejected":
+			b.WriteString("\n- 上次收官终验未通过：" + ev.Detail + "。请重新检查目标和必要工作，补充缺失意图或证据；不能仅重复提交同一收官结论。")
 		case "goal":
 			if len(ev.Goals) == 1 {
 				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了一个目标：%s —— 新的待达成目标，请据此补充探索方向（若尚无对应意图）。", ev.Goals[0]))
@@ -351,7 +353,7 @@ const plannerFindingCoverageGuidance = `
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + plannerFindingCoverageGuidance + artifactSpec(workDir)
+	return body + plannerFindingCoverageGuidance + completionGuidance + artifactSpec(workDir)
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
@@ -369,6 +371,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// runs in a detached goroutine so it never adds latency to this round.
 	p.compactor.OnPlannerRound(ctx, ts)
 	tsx := NewToolSet(ts, "planner")
+	tsx.completionProposal, _ = ctx.Value(completionProposalKey{}).(*CompletionProposal)
 	tsx.SetFindingRecorder(p.findingRecorder)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
@@ -479,5 +482,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 				emit(r)
 			}
 		})
+	tsx.completionResultMu.Lock()
+	defer tsx.completionResultMu.Unlock()
 	return tsx.GoalMet, tsx.Reason, err
 }

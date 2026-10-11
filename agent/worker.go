@@ -439,6 +439,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
 	}
+	settle.AllowedTools = append([]string(nil), workerCheckpointTools...)
+	settle.MaxDuration = 30 * time.Second
+	settle.RequestPrompt = "任务正在申请收官。立即停止新的探测、扩展和委派，仅整理已经获得的证据，使用 record_fact/report_finding 保存事实和漏洞；逐项说明已完成、未完成与受阻检查，然后结束。不要将被停止的检查写成已完成。"
 	opts := agentcore.Options{
 		Provider:        w.prov,
 		SystemPrompt:    system,

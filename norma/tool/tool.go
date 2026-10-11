@@ -159,6 +159,9 @@ func (t *builtTool) CheckPermissions(ctx context.Context, in json.RawMessage, pc
 }
 
 func (t *builtTool) Call(ctx context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
+	if err := CheckExecution(ctx, t.Name()); err != nil {
+		return Errorf(err.Error()), nil
+	}
 	return t.spec.Run(ctx, in, tc)
 }
 

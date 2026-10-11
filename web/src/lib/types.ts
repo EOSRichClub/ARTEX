@@ -4,6 +4,24 @@
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
+export interface TaskCompletion {
+  attempt_id: number;
+  phase: "idle" | "draining" | "reviewing" | "completed" | "interrupted";
+  reason: string;
+  started_at: string;
+  deadline_at: string;
+  updated_at: string;
+  review?: string;
+  remaining_work?: {
+    intent_id: number;
+    state: string;
+    summary: string;
+    kind?: string;
+    reason?: string;
+    reference_id?: number;
+  }[];
+}
+
 export interface Task {
   distinct_findings?: FindingDistinctStats;
   id: string;
@@ -15,6 +33,7 @@ export interface Task {
   description: string;
   goal: string;
   status: TaskStatus;
+  completion?: TaskCompletion;
   created_at: string;
   created_unix?: number; // created_at as unix seconds (run-duration calc)
   completed_at?: string; // RFC3339 finish time (done/failed); "" if unfinished
@@ -1379,6 +1398,89 @@ export interface SSTask {
   progress?: number;
   creatTime?: string;
   endTime?: string;
+}
+
+export type SSSyncStatus = "running" | "success" | "partial" | "failed" | "interrupted";
+
+export interface SSSyncRequest {
+  background?: boolean;
+  retry_run_id?: number;
+  dimension: "project" | "task";
+  targets: string[];
+  target_ids?: Record<string, string>;
+  asset_types: string[];
+  create_company?: boolean;
+  page_size?: number;
+}
+
+export interface SSSyncStats {
+  fetched: number;
+  written: number;
+  skipped: number;
+  failed: number;
+  derived_ip_written: number;
+  derived_ip_failed: number;
+  created?: number;
+  updated?: number;
+  unchanged?: number;
+}
+
+export interface SSSyncTarget {
+  target: string;
+  source_target_id?: string;
+  asset_type: string;
+  status: SSSyncStatus;
+  stats: SSSyncStats;
+  truncated: boolean;
+  error?: string;
+}
+
+export interface SSSyncResult {
+  run_id?: number;
+  status?: SSSyncStatus;
+  synced: Record<string, number>;
+  companies: string[] | null;
+  warnings: string[] | null;
+  errors: string[] | null;
+  stats?: SSSyncStats;
+  counting?: string;
+  targets?: SSSyncTarget[];
+  started_at?: string;
+  finished_at?: string;
+  unique_assets?: {
+    total: number;
+    created: number;
+    updated: number;
+    unchanged: number;
+    direct: number;
+    derived: number;
+  };
+}
+
+export interface SSSyncRun {
+  id: number;
+  status: SSSyncStatus;
+  started_at: string;
+  finished_at?: string;
+  request: SSSyncRequest;
+  result: SSSyncResult | null;
+}
+
+export interface SSSyncItem {
+  raw?: Record<string, unknown> | null;
+  raw_omitted?: boolean;
+  id: number;
+  target: string;
+  source_target_id?: string;
+  asset_type: string;
+  source_asset_id?: string;
+  status: string;
+  reason?: string;
+  asset_id?: number;
+  derived_ip_written: number;
+  derived_ip_failed: number;
+  outcome?: "created" | "updated" | "unchanged";
+  asset_changes?: { asset_id: number; type: string; outcome: "created" | "updated" | "unchanged"; direct: boolean }[];
 }
 
 // ConvTokenSummary — one conversation's token total (+ profile/date) for merging

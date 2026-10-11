@@ -49,7 +49,8 @@ type Server struct {
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
-	concMu sync.Mutex
+	concMu  sync.Mutex
+	ssJobMu sync.Mutex // bound background sync concurrency and resume ownership
 
 	cfgMu     sync.Mutex
 	chatAgent *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
@@ -154,6 +155,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	if err := s.recoverSSSyncRuns(); err != nil {
+		log.Printf("[sync] recover interrupted runs: %v", err)
+	}
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -269,6 +273,12 @@ func (s *Server) restoreTaskRuntimes() {
 	// restore persisted paused state (so a task paused before restart stays paused).
 	for _, t := range m.LoadExisting() {
 		lifecycle := t.lifecycleSnapshot()
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		if err := m.pg.RecoverTaskCompletion(s.ctx, taskID); err != nil {
+			log.Printf("[completion] recover task %s: %v", t.ID, err)
+			s.engine.Pause(t.ID, agent.Causef("completion_recovery_failed", "收官恢复失败，任务已暂停", "无法确认旧收官状态；请检查数据库后重试"))
+			continue
+		}
 		// clear stale 'running' intents from a prior crash/restart (no live worker
 		// owns them) so they re-claim instead of spinning forever in the UI.
 		if n, _ := t.Store.ResetRunningIntents(); n > 0 {
@@ -886,6 +896,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sync/scopesentry/projects", s.syncSSProjects)
 	mux.HandleFunc("GET /api/sync/scopesentry/tasks", s.syncSSTasks)
 	mux.HandleFunc("POST /api/sync/scopesentry/sync", s.syncSSRun)
+	mux.HandleFunc("POST /api/sync/scopesentry/jobs", s.syncSSStartJob)
+	mux.HandleFunc("POST /api/sync/scopesentry/history/{id}/resume", s.syncSSResumeJob)
+	mux.HandleFunc("GET /api/sync/scopesentry/history", s.syncSSHistory)
+	mux.HandleFunc("GET /api/sync/scopesentry/history/{id}", s.syncSSHistoryDetail)
 	// Skill CRUD (文件系统)
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
@@ -1054,9 +1068,16 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	distinct, _ := s.m.pg.DistinctFindingStatsByTask()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
+	completions, err := s.m.PG().TaskCompletionSummaries(r.Context())
+	if err != nil {
+		writeErr(w, 500, "读取任务收官状态失败")
+		return
+	}
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		dto.Completion = completionDTO(completions[taskID])
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		metric := metrics[t.ExpID]
 		dto.Tokens = tokenTotalDTO(metric.Tokens)
@@ -1746,6 +1767,13 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	completion, err := s.m.PG().TaskCompletion(r.Context(), taskID)
+	if err != nil {
+		writeErr(w, 500, "读取任务收官状态失败")
+		return
+	}
+	dto.Completion = completionDTO(completion)
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
@@ -3887,6 +3915,12 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	completion, err := s.m.PG().TaskCompletion(r.Context(), taskID)
+	if err != nil {
+		writeErr(w, 500, "读取任务收官记录失败")
+		return
+	}
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
 		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
@@ -3898,6 +3932,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
 		AssetCounts: counts, Findings: findings,
 	})
+	md += completionReport(completion)
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)
 	_, _ = w.Write([]byte(md))

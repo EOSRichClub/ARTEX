@@ -81,6 +81,10 @@ import type {
   SkillCall,
   SkillItem,
   SSProject,
+  SSSyncItem,
+  SSSyncRequest,
+  SSSyncResult,
+  SSSyncRun,
   SSTask,
   Stats,
   Task,
@@ -1169,19 +1173,17 @@ export const api = {
     get<{ tasks: SSTask[] }>(
       `/sync/scopesentry/tasks?page=${page}&size=${size}${search ? `&search=${encodeURIComponent(search)}` : ""}`,
     ).then((r) => arr(r.tasks)),
-  ssSync: (body: {
-    dimension: "project" | "task";
-    targets: string[];
-    asset_types: string[];
-    create_company?: boolean;
-    page_size?: number;
-  }) =>
-    post<{
-      synced: Record<string, number>;
-      companies: string[] | null;
-      warnings: string[] | null;
-      errors: string[] | null;
-    }>("/sync/scopesentry/sync", body),
+  ssSync: (body: SSSyncRequest) => post<SSSyncResult>("/sync/scopesentry/sync", body),
+  ssStartSync: (body: SSSyncRequest) => post<SSSyncResult>("/sync/scopesentry/jobs", body),
+  ssResumeSync: (id: number) => post<SSSyncResult>(`/sync/scopesentry/history/${id}/resume`, {}),
+  ssSyncHistory: (page = 1, size = 20) =>
+    get<{ runs: SSSyncRun[]; total: number; page: number; size: number }>(
+      `/sync/scopesentry/history?page=${page}&size=${size}`,
+    ),
+  ssSyncHistoryDetail: (id: number, page = 1, size = 20, includeRaw = false) =>
+    get<{ run: SSSyncRun; items: SSSyncItem[]; total: number; page: number; size: number }>(
+      `/sync/scopesentry/history/${id}?page=${page}&size=${size}${includeRaw ? "&include_raw=1" : ""}`,
+    ),
 
   // ---- skills (文件系统) ----
   skills: () => get<{ skills: SkillItem[] }>("/skills").then((r) => arr(r.skills)),

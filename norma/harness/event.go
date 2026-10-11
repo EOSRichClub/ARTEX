@@ -35,17 +35,18 @@ type Event struct {
 type TerminalReason string
 
 const (
-	ReasonCompleted         TerminalReason = "completed"           // model ended its turn
-	ReasonBlockingLimit     TerminalReason = "blocking_limit"      // hard context limit hit pre-request
-	ReasonImageError        TerminalReason = "image_error"         // unsupported media (multimodal)
-	ReasonModelError        TerminalReason = "model_error"         // provider/API failure
-	ReasonAbortedStreaming  TerminalReason = "aborted_streaming"   // canceled during streaming
-	ReasonAbortedTools      TerminalReason = "aborted_tools"       // canceled during tool execution
-	ReasonPromptTooLong     TerminalReason = "prompt_too_long"     // overflow recovery exhausted
-	ReasonStopHookPrevented TerminalReason = "stop_hook_prevented" // a Stop hook blocked continuation
-	ReasonHookStopped       TerminalReason = "hook_stopped"        // a tool/hook stopped continuation
-	ReasonMaxTurns          TerminalReason = "max_turns"           // hit MaxTurns
-	ReasonTimeout           TerminalReason = "timeout"             // hit a wall-clock run budget (host-imposed)
+	ReasonCompleted           TerminalReason = "completed"            // model ended its turn
+	ReasonBlockingLimit       TerminalReason = "blocking_limit"       // hard context limit hit pre-request
+	ReasonImageError          TerminalReason = "image_error"          // unsupported media (multimodal)
+	ReasonModelError          TerminalReason = "model_error"          // provider/API failure
+	ReasonAbortedStreaming    TerminalReason = "aborted_streaming"    // canceled during streaming
+	ReasonAbortedTools        TerminalReason = "aborted_tools"        // canceled during tool execution
+	ReasonPromptTooLong       TerminalReason = "prompt_too_long"      // overflow recovery exhausted
+	ReasonStopHookPrevented   TerminalReason = "stop_hook_prevented"  // a Stop hook blocked continuation
+	ReasonHookStopped         TerminalReason = "hook_stopped"         // a tool/hook stopped continuation
+	ReasonMaxTurns            TerminalReason = "max_turns"            // hit MaxTurns
+	ReasonTimeout             TerminalReason = "timeout"              // hit a wall-clock run budget (host-imposed)
+	ReasonSettlementRequested TerminalReason = "settlement_requested" // host requested checkpointing; not goal completion
 )
 
 // ContinueReason names why the loop took another turn. These drive control

@@ -70,9 +70,9 @@ type Task struct {
 	OutputPath  string
 
 	// internal, guarded by Manager.mu
-	backgrounded bool          // surfaced as a background task: notify on exit
-	notified     bool          // completion already enqueued into pending
-	oversize     bool          // terminated by the size watchdog
+	backgrounded bool // surfaced as a background task: notify on exit
+	notified     bool // completion already enqueued into pending
+	oversize     bool // terminated by the size watchdog
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -88,15 +88,15 @@ func (t *Task) info() TaskInfo {
 
 // TaskInfo is an immutable snapshot of a task for safe reads outside the lock.
 type TaskInfo struct {
-	ID          string
-	Kind        TaskKind
-	Command     string
-	Description string
-	Status      TaskStatus
-	ExitCode    int
-	StartTime   time.Time
-	EndTime     time.Time
-	OutputPath  string
+	ID           string
+	Kind         TaskKind
+	Command      string
+	Description  string
+	Status       TaskStatus
+	ExitCode     int
+	StartTime    time.Time
+	EndTime      time.Time
+	OutputPath   string
 	Backgrounded bool
 }
 
@@ -520,6 +520,23 @@ func (m *Manager) Cleanup() {
 	m.closeAllSessions()
 	if m.rootCancel != nil {
 		m.rootCancel()
+	}
+	// Wait for the process waiter to close output handles before removing files.
+	// Windows cannot unlink an output file while the child/waiter still owns it.
+	m.mu.Lock()
+	done := make([]<-chan struct{}, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		done = append(done, task.done)
+	}
+	m.mu.Unlock()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for _, ch := range done {
+		select {
+		case <-ch:
+		case <-timer.C:
+			return // retain files still owned by a process; stale-session GC can retry
+		}
 	}
 	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
 }

@@ -26,7 +26,7 @@ type goalSpec struct {
 //
 // 异步(goroutine)所以调用方立即返回,两条路径行为一致:秒建任务、后台拆目标。
 func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
-	if !s.engine.beginTaskOperation(t.ID) {
+	if !s.engine.beginExecutionOperation(t.ID) {
 		return
 	}
 	s.seed(t, seedText)
@@ -68,6 +68,9 @@ func (s *Server) startTaskEngine(t *Task) {
 func (s *Server) occupiesConcurrencySlot(t *Task) bool {
 	if t == nil {
 		return false
+	}
+	if s.engine.isCompleting(t.ID) {
+		return true
 	}
 	lifecycle := t.lifecycleSnapshot()
 	if lifecycle.Queued || lifecycle.Paused || isTerminalStatus(lifecycle.Status) {
@@ -122,6 +125,9 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	current, exists := s.m.Task(t.ID)
 	if !exists || current != t || s.engine.IsDeleting(t.ID) {
 		return false, fmt.Errorf("task is being deleted")
+	}
+	if s.engine.completionStalled(t.ID) {
+		return false, fmt.Errorf("旧执行尚未退出，收官已隔离；退出前不能继续任务")
 	}
 	if !s.engine.beginTaskOperation(t.ID) {
 		return false, fmt.Errorf("task is being deleted")

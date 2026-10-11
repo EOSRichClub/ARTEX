@@ -266,7 +266,7 @@ func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 			if err := ValidateInput(t.InputSchema(), params); err != nil {
 				return Errorf("Error: invalid params for " + args.ToolName + ": " + err.Error()), nil
 			}
-			return t.Call(ctx, params, tc)
+			return Invoke(ctx, t, params, tc)
 		},
 	})
 }

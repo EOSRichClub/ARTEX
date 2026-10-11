@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
@@ -66,10 +67,12 @@ type ToolSet struct {
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
-	ownerNode int64
-	GoalMet   bool
-	Reason    string
-	writes    WriteCounts
+	ownerNode          int64
+	GoalMet            bool
+	Reason             string
+	completionProposal *CompletionProposal
+	completionResultMu sync.Mutex
+	writes             WriteCounts
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -353,6 +356,10 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 // an empty context and always needs this first).
 func (t *ToolSet) graphOverviewData() map[string]any {
 	out := map[string]any{}
+	out["completion_work_index"] = map[string]any{
+		"tool":        "list_remaining_work",
+		"instruction": "概览只展示部分意图。收官前用 list_remaining_work 逐页核查所有非 done 意图（含 paused/stopped/deleted），直到 has_more=false。",
+	}
 	// goals summary folded in so the planner needn't call list_goals each round.
 	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
 	gsum := make([]map[string]any, 0, len(goals))
@@ -524,6 +531,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	if t.as != nil && t.ts != nil && t.taskID > 0 {
 		{
 			m := map[string]any{}
+			if scope, err := t.taskScopeContext(); err == nil {
+				m["scope"] = scope
+			}
 			if !t.coverageDisabled {
 				if cov, err := t.as.TaskCoverageWithSources(t.taskID); err == nil {
 					m["denominator"] = cov.Denominator
@@ -1157,15 +1167,17 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 func (t *ToolSet) proveGoal() actool.CoreTool {
 	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
 		obj(map[string]any{
-			"goal_id":     idp("目标节点 id"),
-			"evidence_id": idp("证明它的发现/事实节点 id"),
-			"reason":      str("为什么这个证据满足该目标"),
+			"goal_id":        idp("目标节点 id"),
+			"evidence_id":    idp("证明它的发现/事实节点 id"),
+			"reason":         str("为什么这个证据满足该目标"),
+			"remaining_work": completionDispositionSchema(),
 		}, "goal_id", "evidence_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				GoalID     json.RawMessage `json:"goal_id"`
-				EvidenceID json.RawMessage `json:"evidence_id"`
-				Reason     string          `json:"reason"`
+				GoalID     json.RawMessage            `json:"goal_id"`
+				EvidenceID json.RawMessage            `json:"evidence_id"`
+				Reason     string                     `json:"reason"`
+				Remaining  []db.CompletionDisposition `json:"remaining_work"`
 			}
 			_ = json.Unmarshal(in, &a)
 			goal, ev := pid(a.GoalID), pid(a.EvidenceID)
@@ -1180,8 +1192,12 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			if err := t.ts.Link(ev, db.RelProves, goal); err != nil {
+				return actool.Errorf(fmt.Sprintf("保存目标证据失败: %v", err)), nil
+			}
+			if err := t.ts.SetNodeState(goal, "met"); err != nil {
+				return actool.Errorf(fmt.Sprintf("保存目标状态失败: %v", err)), nil
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
@@ -1193,9 +1209,14 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 					}
 				}
 				if allMet {
+					if t.completionProposal != nil {
+						t.completionProposal.setRemaining(a.Remaining)
+					}
+					t.completionResultMu.Lock()
 					t.GoalMet = true
 					t.Reason = fmt.Sprintf("所有 %d 个目标均已 met（最后由 goal %d 触发）", len(goals), goal)
-					return actool.Text(fmt.Sprintf("goal %d marked met；本任务所有目标均已达成，任务自动判定完成", goal)), nil
+					t.completionResultMu.Unlock()
+					return actool.Text(fmt.Sprintf("goal %d marked met；本任务所有目标均已达成，仍须核验必要检查全部完成；剩余重复/无关意图用 prove_goal.remaining_work 逐项说明停止理由，可对已 met 目标再次调用", goal)), nil
 				}
 			}
 			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
@@ -1203,14 +1224,28 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
-		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
+	return writeTool("goal_met", "申请任务收官。全部目标须已证明达成，必要检查须完成。对剩余非 done 意图逐项说明为何重复或与目标无关；系统先收尾、再只读终验并提交。不能用错误、预算耗尽或受阻作为停止必要检查的理由。",
+		obj(map[string]any{"reason": str("全部目标已达成且必要检查已完成的依据"),
+			"remaining_work": map[string]any{"type": "array", "items": obj(map[string]any{
+				"intent_id": idp("剩余意图 ID"), "kind": map[string]any{"type": "string", "enum": []string{"duplicate", "irrelevant"}},
+				"reason": str("停止此检查的明确依据"), "reference_id": idp("duplicate 必填：已完成意图/事实/漏洞 ID"),
+			}, "intent_id", "kind", "reason")}}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct{ Reason string }
-			_ = json.Unmarshal(in, &a)
+			var a struct {
+				Reason    string
+				Remaining []db.CompletionDisposition `json:"remaining_work"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil || strings.TrimSpace(a.Reason) == "" {
+				return actool.Errorf("reason 必填，remaining_work 格式必须正确"), nil
+			}
+			if t.completionProposal != nil {
+				t.completionProposal.setRemaining(a.Remaining)
+			}
+			t.completionResultMu.Lock()
 			t.GoalMet = true
 			t.Reason = a.Reason
-			return actool.Text("acknowledged: goal marked met"), nil
+			t.completionResultMu.Unlock()
+			return actool.Text("已申请收官；尚未提交任务完成"), nil
 		})
 }
 
@@ -2035,7 +2070,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
-		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
+		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.listRemainingWork(), t.addIntent(), t.proveGoal(), t.goalMet(),
 		t.killWorkTool(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),

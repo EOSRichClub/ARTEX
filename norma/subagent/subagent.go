@@ -110,6 +110,9 @@ func Run(ctx context.Context, cfg Config, agentType, prompt, workDir string) (st
 
 // run executes a subagent to completion and returns its final text.
 func run(ctx context.Context, cfg Config, def Definition, agentType, prompt, workDir string) (string, error) {
+	if err := tool.CheckExecution(ctx, "Agent"); err != nil {
+		return "", err
+	}
 	if cfg.Hooks != nil {
 		if hs, ok := cfg.Hooks.(interface {
 			FireSubagentStart(context.Context, string)

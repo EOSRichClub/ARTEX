@@ -98,17 +98,27 @@ type QueryInput struct {
 
 	// Settlement, when non-nil with a Prompt, runs a bounded wrap-up phase the
 	// moment a budget (MaxTurns/MaxDuration) is hit: it injects Prompt as a user
-	// turn and hides DisabledTools, so a budget-terminated run can checkpoint its
+	// turn and enforces its tool restrictions, so a budget-terminated run can checkpoint its
 	// findings instead of ending abruptly. The run still finishes with the budget's
 	// reason (ReasonMaxTurns/ReasonTimeout), never ReasonCompleted. Nil = off.
 	Settlement *Settlement
 }
 
-// Settlement configures the wrap-up phase that runs when a budget is hit.
+// Settlement configures the wrap-up phase for a budget or host close request.
 type Settlement struct {
 	Prompt        string   // wrap-up instruction injected as a user turn (empty = settlement off)
 	MaxTurns      int      // turn budget for the wrap-up phase itself (0 = default 2)
-	DisabledTools []string // tool names hidden from the model during wrap-up (e.g. ["Bash"])
+	DisabledTools []string // tools hidden AND denied at execution during wrap-up (e.g. ["Bash"])
+	// AllowedTools, when non-nil, is an exact-name allowlist enforced at dispatch,
+	// including deferred tools and subagents. An empty non-nil slice denies all
+	// tools. External requests without an allowlist also deny all tools.
+	AllowedTools []string
+	// MaxDuration bounds model calls and tools once wrap-up begins. External or
+	// allowlisted wrap-up defaults to 30 seconds; legacy budget-only wrap-up keeps
+	// its existing duration behavior when this is zero.
+	MaxDuration time.Duration
+	// RequestPrompt overrides Prompt for an external SettlementController request.
+	RequestPrompt string
 	// PromptByReason optionally overrides Prompt based on WHY the run settled
 	// (keyed by the terminal reason, e.g. ReasonTimeout / ReasonMaxTurns). When the
 	// settling reason has a non-empty entry here it is used; otherwise Prompt is used.
@@ -120,6 +130,9 @@ type Settlement struct {
 // promptFor returns the wrap-up prompt to inject for a settling reason: the
 // PromptByReason override when present and non-empty, else the base Prompt.
 func (s *Settlement) promptFor(reason TerminalReason) string {
+	if reason == ReasonSettlementRequested && s.RequestPrompt != "" {
+		return s.RequestPrompt
+	}
 	if s.PromptByReason != nil {
 		if p := s.PromptByReason[reason]; p != "" {
 			return p
@@ -239,9 +252,13 @@ type loop struct {
 	startTime       time.Time // loop start, for MaxDuration (wall-clock budget)
 
 	// settlement (wrap-up) phase state, entered when a budget is hit
-	settling     bool
-	settleReason TerminalReason // the budget reason to finish with after wrap-up
-	settleTurn   int
+	settling          bool
+	settleReason      TerminalReason // the budget reason to finish with after wrap-up
+	settleTurn        int
+	settleCtx         context.Context
+	settleCancel      context.CancelFunc
+	settlementControl *SettlementController
+	settlementPolicy  *settlementPolicy
 
 	// recovery / continuation state
 	maxOutputTokensOverride      int
@@ -343,6 +360,9 @@ func countBoundaries(msgs []llm.Message) int {
 }
 
 func (l *loop) finish(reason TerminalReason, err error, text string) {
+	// Revoke the controlled scope before publishing its terminal event. A host
+	// consuming the event must never observe "finished" while tools are admitted.
+	l.closeSettlementPolicy()
 	l.yield(Event{Kind: KindResult, Terminal: &Terminal{
 		Reason:   reason,
 		Err:      err,
@@ -364,6 +384,8 @@ func (l *loop) maxTokens() int {
 }
 
 func (l *loop) run() {
+	l.initSettlementPolicy()
+	defer l.closeSettlementPolicy()
 	var schemas []llm.ToolSchema
 	if l.in.Tools != nil {
 		schemas = l.in.Tools.Schemas()
@@ -392,6 +414,16 @@ func (l *loop) run() {
 			l.finish(ReasonAbortedStreaming, l.ctx.Err(), "")
 			return
 		}
+		if l.settling && l.phaseContext().Err() != nil {
+			l.finish(l.settleReason, l.phaseContext().Err(), "")
+			return
+		}
+		if !l.settling && l.settlementRequested() {
+			if !l.beginSettlement(ReasonSettlementRequested, &schemas) {
+				l.finish(ReasonSettlementRequested, nil, "")
+				return
+			}
+		}
 		// Defensive backstop against a pathological recovery/continuation loop.
 		// turnCount itself only counts tool-turns (below); every continuation path
 		// is individually bounded, so this guard should never fire in practice.
@@ -403,10 +435,17 @@ func (l *loop) run() {
 
 		// Non-destructive proactive compaction (MicroCompact → AutoCompact).
 		if l.in.Compactor != nil {
-			l.messages = l.in.Compactor.Pre(l.ctx, l.messages, l.lastInputTokens)
+			l.messages = l.in.Compactor.Pre(l.phaseContext(), l.messages, l.lastInputTokens)
 			l.recordNewBoundary()
 		}
 
+		if l.settling {
+			if l.settleTurn >= l.settleMaxTurns() {
+				l.finish(l.settleReason, nil, "")
+				return
+			}
+			l.settleTurn++
+		}
 		usageBefore := l.usage
 		asst, exec, stopReason, streamErr, consumerStopped, aborted := l.streamAndExecute(schemas)
 		if consumerStopped {
@@ -417,10 +456,14 @@ func (l *loop) run() {
 				l.finish(ReasonAbortedStreaming, l.ctx.Err(), "")
 				return
 			}
+			if l.settling && l.phaseContext().Err() != nil {
+				l.finish(l.settleReason, l.phaseContext().Err(), "")
+				return
+			}
 			// Reactive recovery from prompt-too-long: one forced AutoCompact, then retry.
 			if l.in.Compactor != nil && l.in.Compactor.IsOverflow(streamErr) && !l.hasAttemptedReactiveCompact {
 				l.hasAttemptedReactiveCompact = true
-				if msgs, ok := l.in.Compactor.Reactive(l.ctx, l.messages); ok {
+				if msgs, ok := l.in.Compactor.Reactive(l.phaseContext(), l.messages); ok {
 					l.messages = msgs
 					l.recordNewBoundary()
 					l.lastContinue = ContinueReactiveCompactRetry
@@ -447,6 +490,21 @@ func (l *loop) run() {
 			}
 		}
 		toolUses := asst.ToolUses()
+		if len(toolUses) == 0 && l.ctx.Err() != nil {
+			l.finish(ReasonAbortedStreaming, l.ctx.Err(), asst.Text())
+			return
+		}
+		if len(toolUses) == 0 && l.settling && l.phaseContext().Err() != nil {
+			l.finish(l.settleReason, l.phaseContext().Err(), asst.Text())
+			return
+		}
+		if len(toolUses) == 0 && !l.settling && l.settlementRequested() {
+			if l.beginSettlement(ReasonSettlementRequested, &schemas) {
+				continue
+			}
+			l.finish(ReasonSettlementRequested, nil, asst.Text())
+			return
+		}
 
 		// max_tokens truncation with no tool calls → escalate / resume-recovery.
 		// These continuations are retries of the same turn (they do not advance
@@ -524,6 +582,18 @@ func (l *loop) run() {
 			l.finish(ReasonAbortedTools, l.ctx.Err(), "")
 			return
 		}
+		if l.settling && l.phaseContext().Err() != nil {
+			l.finish(l.settleReason, l.phaseContext().Err(), "")
+			return
+		}
+		if !l.settling && l.settlementRequested() {
+			if l.beginSettlement(ReasonSettlementRequested, &schemas) {
+				l.lastContinue = ContinueNextTurn
+				continue
+			}
+			l.finish(ReasonSettlementRequested, nil, "")
+			return
+		}
 		// aborted with the parent still alive ⇒ the run's own MaxDuration deadline (on
 		// toolCtx) interrupted an in-flight tool. Enter the wrap-up phase on the live
 		// parent ctx instead of dying, so a run whose tool overran the wall-clock budget
@@ -531,11 +601,10 @@ func (l *loop) run() {
 		// (MaxTurns is only ever checked at the turn boundary), hence ReasonTimeout.
 		if aborted {
 			if l.settling {
-				l.finish(l.settleReason, nil, "")
+				l.finish(l.settleReason, l.phaseContext().Err(), "")
 				return
 			}
 			if l.beginSettlement(ReasonTimeout, &schemas) {
-				l.toolCtx = l.ctx // wrap-up tools run live, bounded only by settleMaxTurns
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -548,7 +617,6 @@ func (l *loop) run() {
 		if l.settling {
 			// wrap-up phase: bounded by its own small turn budget. When spent, finish
 			// with the original budget reason (not "completed").
-			l.settleTurn++
 			if l.settleTurn >= l.settleMaxTurns() {
 				l.finish(l.settleReason, nil, "")
 				return
@@ -588,7 +656,7 @@ func (l *loop) settleMaxTurns() int {
 }
 
 // beginSettlement enters the wrap-up phase when configured: injects the caller's
-// prompt as a user turn and hides DisabledTools, so a budget-terminated run can
+// prompt as a user turn and enforces its tool policy, so a terminated run can
 // checkpoint its findings. Returns false when no settlement is configured (caller
 // then finishes immediately).
 func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema) bool {
@@ -606,9 +674,17 @@ func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema)
 	l.settling = true
 	l.settleReason = reason
 	l.settleTurn = 0
-	if len(s.DisabledTools) > 0 {
-		*schemas = filterToolSchemas(*schemas, s.DisabledTools)
+	l.startSettlementDeadline(s, reason)
+	if l.settlementPolicy != nil {
+		l.settlementPolicy.active.Store(true)
 	}
+	allowed := make([]llm.ToolSchema, 0, len(*schemas))
+	for _, schema := range *schemas {
+		if tool.CheckExecution(l.phaseContext(), schema.Name) == nil {
+			allowed = append(allowed, schema)
+		}
+	}
+	*schemas = allowed
 	return true
 }
 
@@ -771,7 +847,7 @@ func messageHasToolUse(m llm.Message, name string) bool {
 // Either way l.messages is left untouched.
 func (l *loop) requestMessages() []llm.Message {
 	if v, ok := l.in.Compactor.(ContextView); ok {
-		return v.View(l.ctx, l.messages)
+		return v.View(l.phaseContext(), l.messages)
 	}
 	return llm.MessagesForAPI(l.messages)
 }
@@ -817,7 +893,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		return exec.drain()
 	}
 
-	for ev, e := range l.deps.CallModel(l.ctx, req) {
+	for ev, e := range l.deps.CallModel(l.phaseContext(), req) {
 		if e != nil {
 			err = e
 			break
@@ -872,7 +948,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 // emission, and recorder all see identical numbers.
 func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	exec = newStreamExec(l)
-	msg, sr, usage, cerr := l.deps.CallModelSync(l.ctx, req)
+	msg, sr, usage, cerr := l.deps.CallModelSync(l.phaseContext(), req)
 	if cerr != nil {
 		return asst, exec, "", cerr, false, false
 	}

@@ -46,6 +46,7 @@ import { toast } from "sonner";
 
 import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
 import { StatusBadge } from "@/components/status-badge";
+import { TaskCompletionBadge } from "@/components/task-completion";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
@@ -1210,6 +1211,7 @@ const TaskRow = React.memo(function TaskRow({
       </TableCell>
       <TableCell>
         <StatusBadge domain="task" value={task.status} dot />
+        <TaskCompletionBadge task={task} />
       </TableCell>
       <TableCell className="text-muted-foreground text-center text-xs tabular-nums">
         {typeof task.goals_total === "number" && task.goals_total > 0 ? (
