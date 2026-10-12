@@ -3,6 +3,8 @@ package intercept
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -69,7 +71,7 @@ func TestReviewInputExplicitBackgroundOnly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if in.Version != 4 || in.WorkingDir != "/tmp/task-1" {
+			if in.Version != 5 || in.WorkingDir != "/tmp/task-1" {
 				t.Fatalf("wrong environment: %+v", in)
 			}
 			if source == BackgroundUserMessage {
@@ -109,6 +111,75 @@ func TestReviewInputBoundsAndInvalidContext(t *testing.T) {
 	}
 	if _, err := BuildReviewInput(t.Context(), "Read", json.RawMessage(`{"broken"`)); err == nil {
 		t.Fatal("accepted invalid current arguments")
+	}
+}
+
+func TestReviewInputCapturesCompleteScript(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cleanup.py")
+	content := "import os\nos.remove('/srv/production/orders.csv')\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := BuildReviewInput(WithReviewWorkingDirectory(t.Context(), dir), "Bash", json.RawMessage(`{"command":"python3 ./cleanup.py"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Version != 5 || in.ScriptCaptureStatus != "complete" || len(in.Scripts) != 1 || in.Scripts[0].Path != path || in.Scripts[0].Content != content || in.Scripts[0].SHA256 == "" || in.Scripts[0].Truncated {
+		t.Fatalf("script snapshot missing: %+v", in)
+	}
+}
+
+func TestReviewInputResolvesCdAndSourceScript(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "login.sh")
+	if err := os.WriteFile(path, []byte("TOKEN=$(curl https://example.test/login)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := "cd " + dir + " && source login.sh"
+	args, _ := json.Marshal(map[string]string{"command": command})
+	in, err := BuildReviewInput(WithReviewWorkingDirectory(t.Context(), "/tmp/other"), "Bash", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.ScriptCaptureStatus != "complete" || len(in.Scripts) != 1 || in.Scripts[0].Path != path || !strings.Contains(in.Scripts[0].Content, "TOKEN") {
+		t.Fatalf("cd/source script was not captured: %+v", in)
+	}
+}
+
+func TestReviewInputMarksMissingScriptIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	in, err := BuildReviewInput(WithReviewWorkingDirectory(t.Context(), dir), "Bash", json.RawMessage(`{"command":"bash ./missing.sh"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.ScriptCaptureStatus != "incomplete" || len(in.Scripts) != 1 || in.Scripts[0].ReadError == "" {
+		t.Fatalf("missing script not recorded: %+v", in)
+	}
+}
+
+func TestReviewInputMarksDynamicScriptPathIncomplete(t *testing.T) {
+	in, err := BuildReviewInput(WithReviewWorkingDirectory(t.Context(), t.TempDir()), "Bash", json.RawMessage(`{"command":"python3 \"$SCRIPT_PATH\""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.ScriptCaptureStatus != "incomplete" || len(in.Scripts) != 1 || in.Scripts[0].ReadError == "" {
+		t.Fatalf("dynamic script path was treated as safe: %+v", in)
+	}
+}
+
+func TestReviewInputMarksOversizedScriptIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large.sh")
+	if err := os.WriteFile(path, []byte(strings.Repeat("echo x\n", maxReviewScriptBytes)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := BuildReviewInput(WithReviewWorkingDirectory(t.Context(), dir), "Bash", json.RawMessage(`{"command":"./large.sh"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.ScriptCaptureStatus != "incomplete" || len(in.Scripts) != 1 || !in.Scripts[0].Truncated || in.Scripts[0].Content != "" {
+		t.Fatalf("oversized script not bounded: %+v", in.Scripts)
 	}
 }
 
@@ -154,7 +225,7 @@ func TestAutomaticAllowRetainsActualReviewContext(t *testing.T) {
 	reason := "实际操作：读取测试文件；成功后的后果：返回文件内容；命中规则：A5"
 	a := auditFor(ctx, Decision{Action: "allow", Message: reason, ModelInput: raw, ModelInputDigest: digestInput(raw)}, args, "allowed")
 	var saved ReviewInput
-	if json.Unmarshal(a.ModelInput, &saved) != nil || saved.Background == nil || saved.Background.Text != "请读取刚创建的文件" || saved.Version != 4 || a.Correlation != "exact" || a.ToolUseID != "current" || a.InitialReason != reason {
+	if json.Unmarshal(a.ModelInput, &saved) != nil || saved.Background == nil || saved.Background.Text != "请读取刚创建的文件" || saved.Version != 5 || a.Correlation != "exact" || a.ToolUseID != "current" || a.InitialReason != reason {
 		t.Fatal("automatic allow lost the model's input or explanation")
 	}
 	if a.Context != nil || a.UserMessage != "" {

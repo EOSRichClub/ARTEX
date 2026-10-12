@@ -2548,18 +2548,37 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/history" || (seg[0] === "intercept" && seg[1] === "task")) {
     const status = q.get("status") || "";
     const decisionSource = q.get("decision_source") || "";
+    const search = (q.get("q") || "").trim();
+    const from = q.get("from") || "";
+    const to = q.get("to") || "";
     if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
     if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
+    if ([...search].length > 200) throw new Error("搜索关键词不能超过 200 个字符");
+    if (search.startsWith("#") && !/^#[1-9]\d*$/.test(search)) throw new Error("审批编号必须为 # 后接正整数");
+    for (const value of [from, to]) {
+      if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error("日期必须是 YYYY-MM-DD");
+    }
+    if (from && to && from > to) throw new Error("开始日期不能晚于结束日期");
     const filtered = mockInterceptHistory.filter((row) => {
-      const source =
-        row.decision_source || (row.rule_id ? "rule" : row.reason?.startsWith("[模型]") ? "model" : "unknown");
+      let source = row.decision_source;
+      if (!source) {
+        if (row.rule_id) source = "rule";
+        else if (row.reason?.startsWith("[模型]")) source = "model";
+        else source = "unknown";
+      }
+      const haystack = JSON.stringify({ ...row, audit: mockInterceptDetails[row.id] ?? null }).toLowerCase();
+      const day = row.created_at.slice(0, 10);
       return (
         (seg[1] !== "task" || row.task_id === decodeURIComponent(seg[2])) &&
         (!status || row.status === status) &&
-        (!decisionSource || source === decisionSource)
+        (!decisionSource || source === decisionSource) &&
+        (!from || day >= from) &&
+        (!to || day <= to) &&
+        (!search ||
+          (search.startsWith("#") ? row.id === Number(search.slice(1)) : haystack.includes(search.toLowerCase())))
       );
     });
-    if (!q.has("page") && !q.has("size") && !status && !decisionSource)
+    if (!q.has("page") && !q.has("size") && !status && !decisionSource && !search && !from && !to)
       return { items: filtered, total: filtered.length };
     const page = Math.max(1, Number(q.get("page")) || 1);
     const size = Math.min(100, Math.max(1, Number(q.get("size")) || 20));
@@ -2596,7 +2615,36 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   // ── 旁路提问(/btw)：demo 无旁路会话 ──
   // 必须显式命中：路径以 s 结尾会被下面的读兜底判成集合返回 []，items 就成了 undefined。
   if (seg.at(-1) === "side-questions") {
-    if (m === "GET") return { items: [], current: null, next_cursor: 0, snapshot: null };
+    if (m === "GET") {
+      if (seg[0] === "intercept" && seg[1] === "history") {
+        return {
+          items: [],
+          current: null,
+          next_cursor: 0,
+          snapshot: {
+            captured_at: new Date().toISOString(),
+            model: { model: "demo-review", name: "审查模型", format: "openai", profile_id: 1 },
+            available: true,
+            reason: "",
+          },
+        };
+      }
+      return { items: [], current: null, next_cursor: 0, snapshot: null };
+    }
+    if (m === "POST" && seg[0] === "intercept" && seg[1] === "history") {
+      return {
+        id: `approval-btw-${Date.now()}`,
+        ordinal: Date.now(),
+        client_request_id: b.client_request_id,
+        question: b.question,
+        answer: "演示模式：此旁路回答基于当前审批记录中的命令、用户消息和脚本快照。",
+        status: "completed",
+        model: { model: "demo-review", name: "审查模型", format: "openai", profile_id: 1 },
+        snapshot_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+        sequence: 1,
+      };
+    }
     if (m === "POST") throw new Error("演示模式不支持旁路提问");
   }
 

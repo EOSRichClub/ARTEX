@@ -3649,6 +3649,21 @@ export const interceptDetails: Record<number, InterceptAudit> = {
     initial_reason: "[模型] 疑似备份表，无法确定是否生产数据。",
     profile_id: 1,
     execution_status: "not_started",
+    model_input: {
+      version: 5,
+      working_directory: "/app/data/tasks/48/i2182",
+      script_capture_status: "complete",
+      script_files: [
+        {
+          path: "/app/data/tasks/48/i2182/cleanup.sql",
+          sha256: "demo-cleanup-sha256",
+          bytes: 92,
+          content: "DROP TABLE users_bak_0921;\n-- 仅用于本次测试的脚本说明待核实。\n",
+        },
+      ],
+      tool_name: "Bash",
+      arguments: { command: "mysql -e 'source cleanup.sql'" },
+    },
   },
 };
 

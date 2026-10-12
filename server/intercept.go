@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
@@ -321,7 +323,33 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
-	filter := db.InterceptApprovalFilter{Status: q.Get("status"), DecisionSource: q.Get("decision_source")}
+	filter := db.InterceptApprovalFilter{
+		Status:         q.Get("status"),
+		DecisionSource: q.Get("decision_source"),
+		Search:         strings.TrimSpace(q.Get("q")),
+		CreatedFrom:    q.Get("from"),
+		CreatedTo:      q.Get("to"),
+	}
+	if utf8.RuneCountInString(filter.Search) > 200 {
+		return filter, fmt.Errorf("q 不能超过 200 个字符")
+	}
+	if strings.HasPrefix(filter.Search, "#") {
+		id, err := strconv.ParseInt(strings.TrimPrefix(filter.Search, "#"), 10, 64)
+		if err != nil || id <= 0 {
+			return filter, fmt.Errorf("审批编号必须为 # 后接正整数")
+		}
+	}
+	for name, value := range map[string]string{"from": filter.CreatedFrom, "to": filter.CreatedTo} {
+		if value == "" {
+			continue
+		}
+		if _, err := time.Parse("2006-01-02", value); err != nil {
+			return filter, fmt.Errorf("%s 必须是 YYYY-MM-DD 日期", name)
+		}
+	}
+	if filter.CreatedFrom != "" && filter.CreatedTo != "" && filter.CreatedFrom > filter.CreatedTo {
+		return filter, fmt.Errorf("from 不能晚于 to")
+	}
 	switch filter.Status {
 	case "", "pending", "allowed", "denied", "timeout":
 	default:

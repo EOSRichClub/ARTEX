@@ -97,6 +97,7 @@ import type {
   TaskGoal,
   TaskLLMResolutions,
   TaskNode,
+  TaskSchedule,
   TaskScopeRow,
   TaskTemplate,
   TokenTotal,
@@ -237,6 +238,9 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
   const query = new URLSearchParams({ page: String(page), size: String(size) });
   if (filter.status) query.set("status", filter.status);
   if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  if (filter.q?.trim()) query.set("q", filter.q.trim());
+  if (filter.from) query.set("from", filter.from);
+  if (filter.to) query.set("to", filter.to);
   return query.toString();
 }
 

@@ -483,6 +483,14 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	if err != nil {
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
 	}
+	// A script invocation whose source could not be captured is never safe to
+	// auto-allow: the model must not infer that an opaque or partial script has
+	// no side effects. Preserve an explicit deny, but convert an allow (including
+	// a configured fail-open response) into human review.
+	if input.ScriptCaptureStatus == "incomplete" && out.Action == "allow" {
+		out.Action = "ask"
+		out.Message = "脚本未能完整附加，无法排除隐藏副作用，需要人工确认"
+	}
 	switch out.Action {
 	case "allow", "ask", "deny":
 		// valid verdict
