@@ -164,11 +164,11 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 					sum = errEmptyModelResponse.Error()
 				}
 				u := terminal.Usage // cumulative token usage for this session
-				rec(db.Activity{Kind: "result", IsError: terminal.Err != nil,
+				rec(db.Activity{Kind: "result", IsError: terminalResultIsError(&terminal),
 					Summary: firstLine(sum, 400), Detail: detail,
 					InputTokens: &u.InputTokens, OutputTokens: &u.OutputTokens,
 					CacheReadTokens: &u.CacheReadTokens, CacheWriteTokens: &u.CacheWriteTokens})
-				if terminal.Err != nil {
+				if terminalResultIsError(&terminal) {
 					rerr = terminal.Err
 				}
 			}

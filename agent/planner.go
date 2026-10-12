@@ -415,6 +415,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
 	}
+	reserveWrapupBudget(settle, maxDur)
 	opts := agentcore.Options{
 		Provider:        p.prov,
 		SystemPrompt:    system,

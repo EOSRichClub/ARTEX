@@ -133,4 +133,4 @@ func (p *Planner) ReviewCompletion(ctx context.Context, taskID int64, ts *db.Exp
 
 // Checkpoint tools save already obtained evidence; they cannot start another
 // probe, delegate work, change scope or unlock an arbitrary extension tool.
-var workerCheckpointTools = []string{"record_fact", "report_finding", "list_findings", "list_facts", "node_detail", "list_goals", "Read", "Write", "Edit", "LS", "traffic_search", "traffic_get", "traffic_blob", "TodoWrite"}
+var workerCheckpointTools = []string{"insert_assets", "record_fact", "report_finding", "list_findings", "list_facts", "node_detail", "list_goals", "Read", "Write", "Edit", "LS", "traffic_search", "traffic_get", "traffic_blob", "TodoWrite"}

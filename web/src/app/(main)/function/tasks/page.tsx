@@ -236,7 +236,7 @@ const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
   { value: "paused", label: "已暂停" },
   { value: "done", label: "已完成" },
   { value: "failed", label: "失败" },
-  { value: "timeout", label: "已超时" },
+  { value: "timeout", label: "预算结束" },
 ];
 
 // Select 不接受空字符串 value,所以「无分类」在筛选器、新建表单和批量移动里
@@ -3360,7 +3360,7 @@ function CreateTaskSheet({
                     onChange={(e) => setTimeoutMin(e.target.value)}
                   />
                   <p className="text-muted-foreground text-xs">
-                    到点后触发优雅收尾（各 agent 写回 + planner 终局判定），任务进入 timeout 终态。
+                    系统会在截止前进入预留收尾，保存各 Agent 的检查点并由规划 Agent 做终局判定；timeout 表示预算结束、部分完成且可以继续，不等同于调查失败。
                   </p>
                 </div>
                 <div className="grid gap-2">

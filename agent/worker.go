@@ -151,7 +151,7 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "你已进入运行预算的预留收尾窗口；预算结束不等于调查失败，当前进展会保留供后续继续。不要再运行任何新命令、探测或委派。请依次：(1) 把已经识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) 最后输出简短纯文本，明确列出【已完成】【未完成】【下次继续】；不得把被停止或尚未验证的检查写成已完成。"
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
@@ -440,8 +440,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
 	}
 	settle.AllowedTools = append([]string(nil), workerCheckpointTools...)
-	settle.MaxDuration = 30 * time.Second
-	settle.RequestPrompt = "任务正在申请收官。立即停止新的探测、扩展和委派，仅整理已经获得的证据，使用 record_fact/report_finding 保存事实和漏洞；逐项说明已完成、未完成与受阻检查，然后结束。不要将被停止的检查写成已完成。"
+	reserveWrapupBudget(settle, maxDur)
+	settle.RequestPrompt = "任务正在申请收官。立即停止新的探测、扩展和委派，仅整理已经获得的证据，使用 insert_assets/record_fact/report_finding 保存资产、事实和漏洞；最后明确列出【已完成】【未完成】【下次继续】。预算结束不是调查失败，不要将被停止的检查写成已完成。"
 	opts := agentcore.Options{
 		Provider:        w.prov,
 		SystemPrompt:    system,

@@ -173,7 +173,11 @@ func (l *loop) startSettlementDeadline(s *Settlement, reason TerminalReason) {
 	}
 	l.settleCtx = l.ctx
 	if duration > 0 {
-		l.settleCtx, l.settleCancel = context.WithTimeout(l.ctx, duration)
+		deadline := time.Now().Add(duration)
+		if l.settlementReserve() > 0 && !l.runDeadline.IsZero() && l.runDeadline.Before(deadline) {
+			deadline = l.runDeadline
+		}
+		l.settleCtx, l.settleCancel = context.WithDeadline(l.ctx, deadline)
 	}
 	l.toolCtx = l.settleCtx
 }

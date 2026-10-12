@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -33,8 +34,8 @@ func (t *runTrace) done(id string) {
 var reasonHint = map[harness.TerminalReason]string{
 	harness.ReasonSettlementRequested: "收到任务收官请求，本轮仅整理并保存已有证据；未完成检查仍须经过终验，不能视为成功完成",
 	harness.ReasonCompleted:           "模型正常结束了本轮，但没有留下文字总结；事实和资产以本轮工具调用记录为准",
-	harness.ReasonMaxTurns:            "达到步数上限(MaxTurns)：SDK 已执行收尾并写回事实和资产，意图会标记为 exhausted，供规划者换方向继续，而不是作为失败处理",
-	harness.ReasonTimeout:             "达到单次运行的墙钟预算(MaxDuration)：到点会打断在跑的工具并就地进收尾，把已识别的事实和资产写回，意图会标记为 exhausted",
+	harness.ReasonMaxTurns:            "达到步数上限(MaxTurns)：已进入收尾并保存事实和资产；这是可继续的预算终态，意图标记为 exhausted，不作为调查失败处理",
+	harness.ReasonTimeout:             "达到单次运行的墙钟预算(MaxDuration)：系统已提前进入预留收尾窗口并保存检查点；这是可继续的预算终态，意图标记为 exhausted，不作为调查失败处理",
 	harness.ReasonModelError:          "模型或 API 调用失败（网络、鉴权、限流、供应商 5xx 等），重试用尽后意图标记为 blocked——传输层故障导致这条意图基本没真正探成；查其执行过程（get_worker_trace）后再决定重派或换法",
 	harness.ReasonBlockingLimit:       "上下文长度达到硬上限，请求在发出前被拦截；应收窄意图粒度或压缩工具返回",
 	harness.ReasonPromptTooLong:       "提示词过长且上下文压缩重试已经用尽，无法继续执行",
@@ -70,8 +71,8 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 			stage = "工具执行阶段"
 		}
 		sum = "（运行被中断：" + short + "；停在" + stage + progressSuffix(term, tr) + "，未完成）"
-	} else if reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout {
-		sum = "（达到运行预算上限(" + string(reason) + ")，已收尾写回事实" + progressSuffix(term, tr) + "；本次无文字总结）"
+	} else if isBudgetTerminal(reason) {
+		sum = "（达到运行预算上限(" + string(reason) + ")：已保存当前检查点" + progressSuffix(term, tr) + "；非调查失败，可从未完成项继续）"
 	} else {
 		hint := terminalReasonHint(reason)
 		sum = "（无文字总结，终态 " + terminalReasonLabel(reason) + "：" + firstLine(hint, 80) + "）"
@@ -82,6 +83,9 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	b.WriteString("\n\n")
 	displayReason := terminalReasonLabel(reason)
 	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalReasonHint(reason))
+	if isBudgetTerminal(reason) {
+		b.WriteString("- **结果性质**: 预算结束、部分完成、可继续；不计为调查失败\n")
+	}
 	if aborted {
 		code, _, why, ok := AbortReason(ctx)
 		if ok {
@@ -90,7 +94,9 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 			b.WriteString("- **中断原因**: 无法取得；取消方可能没有通过 context.WithCancelCause 附加具名原因\n")
 		}
 	}
-	if term.Err != nil {
+	if expectedBudgetDeadline(term) {
+		b.WriteString("- **收尾状态**: 预留收尾窗口已用完；已成功写回的事实、资产和漏洞保留\n")
+	} else if term.Err != nil {
 		fmt.Fprintf(&b, "- **底层错误**: `%v`\n", term.Err)
 	}
 	if aborted && strings.TrimSpace(term.Text) != "" {
@@ -117,6 +123,21 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 		fmt.Fprintf(&b, "- **中断前最后一个工具**: `%s`（已正常返回）\n", tr.name)
 	}
 	return sum, b.String()
+}
+
+func isBudgetTerminal(reason harness.TerminalReason) bool {
+	return reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout
+}
+
+func expectedBudgetDeadline(term *harness.Terminal) bool {
+	return term != nil && isBudgetTerminal(term.Reason) && errors.Is(term.Err, context.DeadlineExceeded)
+}
+
+// terminalResultIsError controls the red failure treatment in the activity UI.
+// A settlement deadline belongs to a budget terminal and is therefore a saved,
+// resumable checkpoint rather than an execution failure.
+func terminalResultIsError(term *harness.Terminal) bool {
+	return term != nil && term.Err != nil && !expectedBudgetDeadline(term)
 }
 
 func terminalReasonLabel(reason harness.TerminalReason) string {

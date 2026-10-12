@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"iter"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func drainWithCtx(t *testing.T, ctx context.Context, in QueryInput, deps QueryDe
 func TestSettlementOnToolOverrunsBudget(t *testing.T) {
 	m := &scriptedModel{turns: [][]llm.StreamEvent{
 		toolTurn("s1", "sleep", `{"seconds":3600}`), // hangs far past MaxDuration
-		textTurn("已写回事实并总结"),                          // settlement turn → natural stop
+		textTurn("已写回事实并总结"),                        // settlement turn → natural stop
 	}}
 	in := QueryInput{
 		Messages:       []llm.Message{llm.UserText("go")},
@@ -66,6 +67,46 @@ func TestSettlementOnToolOverrunsBudget(t *testing.T) {
 	}
 	if m.calls != 2 {
 		t.Fatalf("应有 2 次模型调用(主+收尾)，得 %d", m.calls)
+	}
+}
+
+// ReserveDuration is part of MaxDuration, not extra time after it: normal work
+// is interrupted at the start of the reserve and settlement gets the remaining
+// wall-clock window to save a checkpoint and produce final text.
+func TestSettlementReserveStartsBeforeOverallDeadline(t *testing.T) {
+	started := time.Now()
+	var settlementAt time.Duration
+	m := &scriptedModel{turns: [][]llm.StreamEvent{
+		toolTurn("s1", "sleep", `{"seconds":3600}`),
+		textTurn("检查点已保存，可继续"),
+	}}
+	call := func(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		if m.calls == 1 {
+			settlementAt = time.Since(started)
+		}
+		return m.call(ctx, req)
+	}
+	in := QueryInput{
+		Messages:       []llm.Message{llm.UserText("go")},
+		Tools:          tool.NewRegistry(tool.NewSleep()),
+		PermissionMode: permission.ModeBypass,
+		WorkingDir:     t.TempDir(),
+		MaxDuration:    600 * time.Millisecond,
+		Settlement: &Settlement{
+			Prompt:          "SAVE_CHECKPOINT",
+			ReserveDuration: 300 * time.Millisecond,
+			MaxDuration:     300 * time.Millisecond,
+		},
+	}
+	term := drainWithCtx(t, context.Background(), in, QueryDeps{CallModel: call})
+	if term.Reason != ReasonTimeout || term.Text != "检查点已保存，可继续" {
+		t.Fatalf("unexpected terminal: reason=%v text=%q err=%v", term.Reason, term.Text, term.Err)
+	}
+	if settlementAt < 200*time.Millisecond || settlementAt >= 550*time.Millisecond {
+		t.Fatalf("settlement started at %s, want it inside the reserved half", settlementAt)
+	}
+	if elapsed := time.Since(started); elapsed >= 600*time.Millisecond {
+		t.Fatalf("successful settlement exceeded total MaxDuration: %s", elapsed)
 	}
 }
 

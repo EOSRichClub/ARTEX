@@ -1171,14 +1171,14 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	switch {
 	case reason == harness.ReasonSettlementRequested || e.isCompleting(t.ID):
 		state = "exhausted"
-	case err != nil:
-		state = "blocked"
 	case reason == harness.ReasonMaxTurns:
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
 	case reason == harness.ReasonTimeout:
 		state = "exhausted"
-		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
+		log.Printf("[worker %s] intent %d 运行预算结束(exhausted、可继续、非失败)，收尾后写回 %s", name, intent.ID, wrote)
+	case err != nil:
+		state = "blocked"
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)

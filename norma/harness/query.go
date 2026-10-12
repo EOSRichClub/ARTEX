@@ -31,9 +31,11 @@ type QueryInput struct {
 	DeferredTools []string
 	MaxTokens     int
 	Temperature   *float64
-	// MaxTurns bounds tool-turns (0 = off). MaxDuration bounds wall-clock time,
-	// checked at the turn boundary so a turn is never aborted mid-stream — unlike
-	// cancelling ctx, which cuts an in-flight stream/tool (0 = off).
+	// MaxTurns bounds tool-turns (0 = off). MaxDuration is the total wall-clock
+	// budget (0 = off). When Settlement.ReserveDuration is configured, normal work
+	// stops before the total deadline and the remaining time is reserved for
+	// checkpointing and a final summary. An in-flight tool is bounded by the work
+	// deadline; model streams are still allowed to finish their current turn.
 	MaxTurns       int
 	MaxDuration    time.Duration
 	MaxConcurrency int
@@ -117,6 +119,13 @@ type Settlement struct {
 	// allowlisted wrap-up defaults to 30 seconds; legacy budget-only wrap-up keeps
 	// its existing duration behavior when this is zero.
 	MaxDuration time.Duration
+	// ReserveDuration starts a time-budget settlement before the run's total
+	// MaxDuration expires. The reserve is carved out of the total budget rather
+	// than added after it, so checkpointing and a final summary have guaranteed
+	// wall-clock room while the overall run still respects MaxDuration. Values at
+	// or above half the total budget are clamped to half. Zero preserves the
+	// legacy behavior of settling only when the main budget is exhausted.
+	ReserveDuration time.Duration
 	// RequestPrompt overrides Prompt for an external SettlementController request.
 	RequestPrompt string
 	// PromptByReason optionally overrides Prompt based on WHY the run settled
@@ -233,11 +242,11 @@ type budgetTracker struct {
 
 type loop struct {
 	ctx context.Context
-	// toolCtx bounds tool execution with the run's MaxDuration deadline, so a tool
-	// that overruns the wall-clock budget is interrupted mid-flight (the model call
-	// stays on ctx — streams are never cut mid-flight). Derived from ctx, so a parent
-	// cancellation (pause/kill/shutdown) still cancels it. Swapped to ctx once the
-	// wrap-up phase begins, so settlement tools run live, bounded only by settleMaxTurns.
+	// toolCtx bounds normal tool execution with the work deadline (the total
+	// MaxDuration deadline minus any settlement reserve). The model call stays on
+	// ctx so streams are not cut mid-flight. Parent cancellation still propagates.
+	// Once wrap-up begins, settlement gets a fresh context bounded by the remaining
+	// total budget and its own MaxDuration.
 	toolCtx context.Context
 	in      QueryInput
 	deps    QueryDeps
@@ -250,6 +259,8 @@ type loop struct {
 	turnCount       int
 	boundaryCount   int       // boundary markers already seen, so Recorder fires once each
 	startTime       time.Time // loop start, for MaxDuration (wall-clock budget)
+	runDeadline     time.Time // absolute end of the whole run, including settlement
+	workDeadline    time.Time // normal exploration stops here so settlement keeps its reserve
 
 	// settlement (wrap-up) phase state, entered when a budget is hit
 	settling          bool
@@ -398,14 +409,18 @@ func (l *loop) run() {
 	l.turnCount = 1 // the first model call is turn 1
 	l.boundaryCount = countBoundaries(l.messages)
 	l.startTime = time.Now() // wall-clock baseline for MaxDuration
-	// toolCtx carries the MaxDuration deadline so a tool that overruns the wall-clock
-	// budget is interrupted mid-flight (rather than the run only noticing at the next
-	// turn boundary, which a hung tool never reaches). On interrupt the loop enters the
-	// wrap-up phase on the live parent ctx instead of aborting — see the tools branch.
+	// toolCtx carries the normal-work deadline so a tool cannot consume the time
+	// reserved for checkpointing. The overall runDeadline still caps settlement.
+	// On interrupt the loop enters wrap-up on the live parent ctx instead of aborting.
 	l.toolCtx = l.ctx
 	if l.in.MaxDuration > 0 {
+		l.runDeadline = l.startTime.Add(l.in.MaxDuration)
+		l.workDeadline = l.runDeadline
+		if reserve := l.settlementReserve(); reserve > 0 {
+			l.workDeadline = l.runDeadline.Add(-reserve)
+		}
 		var stopTool context.CancelFunc
-		l.toolCtx, stopTool = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
+		l.toolCtx, stopTool = context.WithDeadline(l.ctx, l.workDeadline)
 		defer stopTool()
 	}
 	iterations := 0
@@ -629,7 +644,7 @@ func (l *loop) run() {
 		// On hit, optionally run the wrap-up phase before finishing.
 		nextTurn := l.turnCount + 1
 		hitTurns := l.in.MaxTurns > 0 && nextTurn > l.in.MaxTurns
-		hitTime := l.in.MaxDuration > 0 && time.Since(l.startTime) >= l.in.MaxDuration
+		hitTime := !l.workDeadline.IsZero() && !time.Now().Before(l.workDeadline)
 		if hitTurns || hitTime {
 			reason := ReasonMaxTurns
 			if hitTime && !hitTurns {
@@ -645,6 +660,20 @@ func (l *loop) run() {
 		l.turnCount = nextTurn
 		l.lastContinue = ContinueNextTurn
 	}
+}
+
+// settlementReserve returns the portion of MaxDuration reserved for wrap-up.
+// Never let settlement consume more than half the run: short test/development
+// budgets still get a useful normal-execution window.
+func (l *loop) settlementReserve() time.Duration {
+	if l.in.MaxDuration <= 0 || l.in.Settlement == nil || l.in.Settlement.ReserveDuration <= 0 {
+		return 0
+	}
+	reserve := l.in.Settlement.ReserveDuration
+	if max := l.in.MaxDuration / 2; reserve > max {
+		reserve = max
+	}
+	return reserve
 }
 
 // settleMaxTurns is the wrap-up phase's own turn budget (default 2).

@@ -325,6 +325,11 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   <SaveIcon /> 保存配置
                 </Button>
               </div>
+              {showConfig && (
+                <p className="text-muted-foreground text-xs">
+                  有时限时，系统会在到点前预留约 20%（最少 2 分钟、最多 5 分钟）写回事实并生成收尾总结；预算结束是可继续的部分完成状态，不计为调查失败。
+                </p>
+              )}
               {showWebSearch && (
                 <div className="flex items-center gap-3 border-t pt-3">
                   <Switch

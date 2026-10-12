@@ -138,6 +138,27 @@ func TestTerminalTextNonAbortReasons(t *testing.T) {
 	}
 }
 
+func TestTimeoutCheckpointIsNotRenderedAsFailure(t *testing.T) {
+	trace := &runTrace{startedAt: time.Now().Add(-20 * time.Minute)}
+	trace.start("tu_1", "record_fact", `{"fact":"saved"}`)
+	trace.done("tu_1")
+	term := &harness.Terminal{
+		Reason: harness.ReasonTimeout,
+		Err:    context.DeadlineExceeded,
+		Turns:  32,
+	}
+	summary, detail := terminalText(context.Background(), term, trace)
+	if !strings.Contains(summary, "非调查失败") || !strings.Contains(summary, "可从未完成项继续") {
+		t.Fatalf("timeout summary still looks failed: %q", summary)
+	}
+	if terminalResultIsError(term) {
+		t.Fatal("expected timeout settlement deadline to be a non-error checkpoint")
+	}
+	if strings.Contains(detail, "底层错误") || !strings.Contains(detail, "部分完成、可继续") {
+		t.Fatalf("timeout detail still renders as a failure:\n%s", detail)
+	}
+}
+
 func TestAbortCausesAreWellFormed(t *testing.T) {
 	all := []*AbortCause{
 		AbortPausedByUser, AbortPausedByOrchestrator, AbortTaskDeleted, AbortPausedOnReload,

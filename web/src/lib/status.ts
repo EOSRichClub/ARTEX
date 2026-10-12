@@ -38,8 +38,8 @@ const intent: Record<string, StatusMeta> = {
   done: { label: "已完成", tone: "green" },
   // blocked = 模型/API/网络故障重试用尽，这条意图基本没真正探成（非目标拦截）。
   blocked: { label: "执行出错", tone: "red" },
-  // exhausted = 达到步数/时间预算被中途掐断、只写回部分结果（非方向已探尽）。
-  exhausted: { label: "预算耗尽", tone: "violet" },
+  // exhausted = 达到步数/时间预算并保存检查点，是部分完成且可继续的终态，不是调查失败。
+  exhausted: { label: "预算结束（可继续）", tone: "violet" },
   // stopped = 历史软删除状态（保留,历史数据）。
   stopped: { label: "已停止", tone: "slate" },
   // deleted = 用户假删除了该意图（保留节点与血缘，删除原因见 delete_reason 字段）。
@@ -53,7 +53,7 @@ const task: Record<string, StatusMeta> = {
   paused: { label: "已暂停", tone: "amber" },
   done: { label: "已完成", tone: "green" },
   failed: { label: "失败", tone: "red" },
-  timeout: { label: "已超时", tone: "amber" },
+  timeout: { label: "预算结束", tone: "amber" },
 };
 
 const severity: Record<string, StatusMeta> = {

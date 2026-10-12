@@ -2,6 +2,7 @@ package agent
 
 import (
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/norma/harness"
 )
@@ -41,11 +42,16 @@ var wrapupTurnDefaults = map[string]int{
 
 const genericWrapupTurns = 10
 
+const (
+	minimumWrapupReserve = 2 * time.Minute
+	maximumWrapupReserve = 5 * time.Minute
+)
+
 const plannerWrapUpDefault = "你本轮规划的步数即将用尽——注意只是【这一轮】结束,系统之后仍会随态势变化再次唤醒你继续规划,并非任务终止,你无需在此收束整个规划。请把本轮已经想清楚的结论落地、别让这一轮白跑,但也【不要为了收尾硬凑意图】(本轮 0 个意图仍是完全正常的结果)：(1) 若已判断出【当前就该派发】的探索方向,用一次 add_intent 批量提交(想好的别憋着不发);(2) 对已被某发现/事实证明达成的目标,调 prove_goal 标记 met(别漏判);(3) 若识别出需要分步的串行利用链,用 TodoWrite 记下,便于下次唤醒接着派。做完直接结束本轮,无需输出总结文本。"
 
-const mainAgentWrapUpDefault = "你的步数即将用尽,本次交互就要结束。不要再发起新的探索/操作。请**单独用一句话纯文本**向用户总结当前进展、关键结论,以及建议的下一步。"
+const mainAgentWrapUpDefault = "你已进入运行预算的预留收尾窗口；这不表示任务失败。不要再发起新的探索或操作。请用简短纯文本明确列出【已完成】【未完成】【下次继续】，作为本次可继续的检查点。"
 
-const genericWrapUpDefault = "你即将因预算耗尽被终止。请先把已完成但未落库的结果写回,再**单独用一句话纯文本**总结你做了什么、得到哪些关键结论(这句会作为本次运行的结果展示)。"
+const genericWrapUpDefault = "你已进入运行预算的预留收尾窗口；预算结束不表示任务失败。请先把已完成但未落库的结果写回，再用简短纯文本明确列出【已完成】【未完成】【下次继续】，作为本次可继续的检查点。"
 
 // WrapupDefault returns the built-in default wrap-up prompt for an agent key —
 // used by the admin UI as the "restore default" value and empty-field placeholder.
@@ -96,7 +102,30 @@ func wrapupSettlement(agentKey string, disabledTools []string) *harness.Settleme
 		Prompt:        resolveWrapup(agentKey),
 		DisabledTools: disabledTools,
 		MaxTurns:      resolveWrapupTurns(agentKey),
+		MaxDuration:   maximumWrapupReserve,
 	}
+}
+
+// reserveWrapupBudget carves settlement time out of a run's total wall-clock
+// budget. Normal work receives about 80%; checkpointing and the final summary get
+// the remaining 20%, bounded to 2–5 minutes for ordinary production budgets.
+// Very small test/development budgets keep at least half their time for work.
+func reserveWrapupBudget(settlement *harness.Settlement, total time.Duration) {
+	if settlement == nil || total <= 0 {
+		return
+	}
+	reserve := total / 5
+	if reserve < minimumWrapupReserve {
+		reserve = minimumWrapupReserve
+	}
+	if reserve > maximumWrapupReserve {
+		reserve = maximumWrapupReserve
+	}
+	if max := total / 2; reserve > max {
+		reserve = max
+	}
+	settlement.ReserveDuration = reserve
+	settlement.MaxDuration = reserve
 }
 
 // ---------- 任务级超时收尾词（见 docs/任务级超时与收尾设计.md）----------
@@ -117,9 +146,9 @@ var taskTimeoutWrapupDefaults = map[string]string{
 	"planner": plannerTaskTimeoutDefault,
 }
 
-const workerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是你这次 run 的预算，是整场探索到点了）。这是最后机会：(1) 把你已识别但还没写回的内容【全部】落库——新资产 insert_assets、探索结论/事实 record_fact、确认漏洞 report_finding；(2) 不要再启动任何新命令/探测；(3) **最后单独用一句话纯文本**总结你在本意图上的关键结论。"
+const workerTaskTimeoutDefault = "**整个任务已进入截止时间前的预留收尾窗口**（这不表示调查失败，而是停止扩展并保存可继续的检查点）。这是最后机会：(1) 把已经识别但还没写回的内容【全部】落库——新资产 insert_assets、探索结论/事实 record_fact、确认漏洞 report_finding；(2) 不要再启动任何新命令、探测或委派；(3) 最后输出简短纯文本，明确列出【已完成】【未完成】【下次继续】；不得把被停止的检查写成已完成。"
 
-const plannerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是本轮，是整个任务终止）。请基于当前【全部】事实与发现，做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）。**不要再生成任何新意图**（此时派意图也不会再被执行）。判定完即收束，无需输出总结文本。"
+const plannerTaskTimeoutDefault = "**整个任务已进入截止时间前的预留收尾窗口**（预算结束不等于调查失败）。请基于当前【全部】事实与发现做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）。**不要再生成任何新意图**；保留未完成工作供后续继续。判定完即收束。"
 
 // TaskTimeoutWrapupDefault 返回某 agent 的任务超时内置默认收尾词（供后台占位/恢复默认）。
 func TaskTimeoutWrapupDefault(agentKey string) string {
