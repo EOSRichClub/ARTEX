@@ -24,13 +24,16 @@ RUN NEXT_EXPORT=1 npm run build:static
 FROM golang:1.26-bookworm AS gobuild
 ARG TARGETARCH
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
+ARG ARTEX_BUILD_VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）
 COPY --from=web /web/out/ server/webui/dist/
-RUN CGO_ENABLED=0 GOARCH="${TARGETARCH}" go build -tags embedui -trimpath -o /out/artex ./cmd/artex
+RUN CGO_ENABLED=0 GOARCH="${TARGETARCH}" go build -tags embedui -trimpath \
+      -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
+      -o /out/artex ./cmd/artex
 
 ########## 阶段 3：运行镜像（同原版：工具 + Playwright 预装）##########
 FROM python:3.12-slim-bookworm
