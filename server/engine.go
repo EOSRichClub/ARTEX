@@ -1123,12 +1123,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
-	// if a pause cancelled this run mid-flight, return the intent to the frontier
-	// so it is re-claimed on resume — the worker will resume the prior LLM
-	// conversation from its transcript instead of restarting from scratch.
+	// Recoverable task-level interruptions (pause/delete/process shutdown) return
+	// the intent to the frontier so it can be re-claimed. In particular, a planned
+	// service restart is operational maintenance, not an investigation failure.
+	// The worker resumes from its prior LLM transcript instead of starting over.
 	if ectx.Err() != nil && taskExecutionPaused(context.Cause(ectx)) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
-			log.Printf("[worker %s] task %s 意图 #%d 任务暂停回退失败: %v", name, t.ID, intent.ID, err)
+			log.Printf("[worker %s] task %s 意图 #%d 可恢复中断回退失败: %v", name, t.ID, intent.ID, err)
 		}
 		return true
 	}
@@ -1261,7 +1262,7 @@ func taskExecutionPaused(cause error) bool {
 	}
 	switch abort.Code {
 	case "paused_by_user", "paused_by_orchestrator", "paused_on_reload", "paused_race_guard",
-		"queued_for_admission", "llm_unavailable_queued", "task_deleted":
+		"queued_for_admission", "llm_unavailable_queued", "task_deleted", "shutdown":
 		return true
 	default:
 		return false

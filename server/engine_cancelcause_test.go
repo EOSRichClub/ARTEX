@@ -186,6 +186,9 @@ func TestDeleteCancellationReturnsRunningIntentToFrontier(t *testing.T) {
 	if !taskExecutionPaused(agent.AbortTaskDeleted) {
 		t.Fatal("delete cancellation must settle a running intent as open so AbortDelete can resume it")
 	}
+	if !taskExecutionPaused(agent.AbortShutdown) {
+		t.Fatal("planned service shutdown must return running intents to open instead of blocked")
+	}
 	if taskExecutionPaused(agent.AbortGoalMet) {
 		t.Fatal("terminal task cancellation must not reopen completed work")
 	}
