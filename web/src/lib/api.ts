@@ -97,7 +97,6 @@ import type {
   TaskGoal,
   TaskLLMResolutions,
   TaskNode,
-  TaskSchedule,
   TaskScopeRow,
   TaskTemplate,
   TokenTotal,

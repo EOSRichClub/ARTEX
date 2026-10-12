@@ -1,4 +1,4 @@
-import { syncResultStatus } from "../sync-result.ts";
+import { syncResultStatus } from "./sync-result.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 
