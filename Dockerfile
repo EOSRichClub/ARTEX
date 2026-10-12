@@ -22,13 +22,13 @@ RUN npm config set registry "$NPM_REGISTRY" \
     && npm config set fetch-retry-maxtimeout 20000 \
     && npm config set fetch-timeout 300000 \
     && for attempt in 1 2 3; do \
-         npm ci --ignore-scripts && exit 0; \
+         npm ci --ignore-scripts --include=optional && exit 0; \
          echo "npm ci attempt ${attempt} failed; retrying" >&2; \
          sleep $((attempt * 5)); \
        done; \
        exit 1
 COPY web/ ./
-RUN NEXT_EXPORT=1 npm run build:static
+RUN NEXT_EXPORT=1 npm run build:static -- --webpack
 
 ########## 阶段 2：Go 后端（内嵌前端，静态编译）##########
 FROM golang:1.26-bookworm AS gobuild
