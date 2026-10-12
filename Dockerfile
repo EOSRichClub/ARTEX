@@ -16,7 +16,17 @@ WORKDIR /web
 # --ignore-scripts：跳过 prepare(husky)——容器里没有 .git，husky 会失败；
 # Next.js/Biome 的平台二进制走 optionalDependencies，不依赖生命周期脚本。
 COPY web/package.json web/package-lock.json ./
-RUN npm config set registry "$NPM_REGISTRY" && npm ci --ignore-scripts
+RUN npm config set registry "$NPM_REGISTRY" \
+    && npm config set fetch-retries 5 \
+    && npm config set fetch-retry-mintimeout 2000 \
+    && npm config set fetch-retry-maxtimeout 20000 \
+    && npm config set fetch-timeout 300000 \
+    && for attempt in 1 2 3; do \
+         npm ci --ignore-scripts && exit 0; \
+         echo "npm ci attempt ${attempt} failed; retrying" >&2; \
+         sleep $((attempt * 5)); \
+       done; \
+       exit 1
 COPY web/ ./
 RUN NEXT_EXPORT=1 npm run build:static
 
@@ -27,7 +37,12 @@ ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 ARG ARTEX_BUILD_VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN for attempt in 1 2 3; do \
+      go mod download && exit 0; \
+      echo "go mod download attempt ${attempt} failed; retrying" >&2; \
+      sleep $((attempt * 5)); \
+    done; \
+    exit 1
 COPY . .
 # 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）
 COPY --from=web /web/out/ server/webui/dist/
