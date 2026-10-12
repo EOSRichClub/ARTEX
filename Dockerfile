@@ -10,7 +10,7 @@
 #   --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 
 ########## 阶段 1：前端静态导出 ##########
-FROM node:20-bookworm AS web
+FROM node:22-bookworm AS web
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /web
 # --ignore-scripts：跳过 prepare(husky)——容器里没有 .git，husky 会失败；
@@ -42,11 +42,11 @@ ENV npm_config_registry=$NPM_REGISTRY \
     PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
     PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
-# Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
+# Node 从 NodeSource 装 22.x：满足 Playwright，并为 REA MCP（要求 >=22.19）预留运行环境。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 # Playwright MCP 与 CLI 必须使用同一套精确依赖。不能混装 playwright@latest：
