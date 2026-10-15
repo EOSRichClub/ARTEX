@@ -1,0 +1,46 @@
+[Unit]
+Description=OpenAI-compatible bridge for OpenCode free models
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=artex
+Group=artex
+WorkingDirectory=/opt/artex/opencode-free
+EnvironmentFile=/etc/artex/opencode-free-bridge.env
+Environment=OPENCODE_BRIDGE_PORT=14059
+Environment=OPENCODE_TIMEOUT=300
+Environment=OPENCODE_BRIDGE_CONCURRENCY=2
+Environment=OPENCODE_BIN=/opt/artex/opencode-free/node_modules/.bin/opencode
+Environment=OPENCODE_WORKSPACE=/opt/artex/opencode-free/workspace
+Environment=XDG_DATA_HOME=/opt/artex/opencode-free/data
+Environment=XDG_CONFIG_HOME=/opt/artex/opencode-free/config
+Environment=XDG_CACHE_HOME=/opt/artex/opencode-free/cache
+Environment=XDG_STATE_HOME=/opt/artex/opencode-free/state
+Environment=HTTP_PROXY=http://172.30.0.1:17890
+Environment=HTTPS_PROXY=http://172.30.0.1:17890
+Environment=ALL_PROXY=http://172.30.0.1:17890
+Environment=NO_PROXY=127.0.0.1,localhost,172.30.0.1,::1
+ExecStart=/usr/bin/python3 /opt/artex/opencode-free/opencode_free_bridge.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/artex/opencode-free/data /opt/artex/opencode-free/config /opt/artex/opencode-free/cache /opt/artex/opencode-free/state /opt/artex/opencode-free/workspace
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=128
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
